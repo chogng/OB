@@ -1,1 +1,0 @@
-禁止cargo打包tauri

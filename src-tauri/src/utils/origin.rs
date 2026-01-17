@@ -42,7 +42,23 @@ fn sanitize_path_component(input: &str) -> String {
 
     let out = out.trim_matches('_');
     let out = if out.is_empty() { "origin_job" } else { out };
-    out.chars().take(80).collect()
+
+    // Keep directory names short for Windows path-length safety, but avoid collisions when
+    // users select multiple ZIPs with long, similar prefixes (e.g. "...__Vd=0.05.zip" vs
+    // "...__Vd=0.10.zip") where the distinguishing suffix is beyond the prefix cut.
+    const MAX_LEN: usize = 80;
+    if out.len() <= MAX_LEN {
+        return out.to_string();
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    let suffix = format!("_{:08x}", (hasher.finish() & 0xffff_ffff));
+    let prefix_len = MAX_LEN.saturating_sub(suffix.len());
+    let prefix: String = out.chars().take(prefix_len).collect();
+    format!("{prefix}{suffix}")
 }
 
 fn strip_windows_extended_path_prefix(path: &str) -> String {
@@ -485,6 +501,38 @@ function Write-OriginBridgeError([string]$message) {
   }
 }
 
+function Acquire-OriginAutomationLock([int]$timeoutMs = 600000) {
+  $tmp = $env:TEMP
+  if (-not $tmp) {
+    try { $tmp = [IO.Path]::GetTempPath() } catch { $tmp = '' }
+  }
+  if (-not $tmp) { $tmp = $WorkDir }
+
+  $lockDir = Join-Path $tmp 'OriginBridge'
+  try {
+    if (-not (Test-Path -LiteralPath $lockDir)) {
+      New-Item -ItemType Directory -Force -Path $lockDir | Out-Null
+    }
+  } catch {
+    # ignore
+  }
+
+  $lockPath = Join-Path $lockDir 'origin_automation.lock'
+  Write-OriginBridgeLog "Waiting for Origin automation lock: $lockPath"
+
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+    try {
+      # Exclusive lock across OriginBridge workers to avoid concurrent COM commands
+      # against the same Origin UI instance (can break plot/import state).
+      return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch {
+      Start-Sleep -Milliseconds 200
+    }
+  }
+  throw "Timeout waiting for Origin automation lock (${timeoutMs} ms). Another OriginBridge job may still be running."
+}
+
 function Release-ComObject($obj) {
   try {
     if ($null -ne $obj) {
@@ -743,6 +791,14 @@ function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath, [bool]$c
   $plotCmd = 'plotxy iy:=' + $pairsExpr + ' plot:=202;'
   Write-OriginBridgeLog "Plotting (plotxy): $pairsExpr"
   $plotOk = $origin.Execute($plotCmd)
+  if ((-not $plotOk) -and (-not $createNewBook)) {
+    # When automating an existing Origin UI session, the "current" active window may not be a worksheet.
+    # Retry in a fresh workbook so plotxy has a predictable target.
+    Write-OriginBridgeLog "plotxy failed without newbook; retrying with newbook + impCSV."
+    $importOk2 = $origin.Execute('newbook; impCSV fname:="' + $csvLt + '";')
+    if (-not $importOk2) { throw "Origin impCSV failed (retry)" }
+    $plotOk = $origin.Execute($plotCmd)
+  }
   if (-not $plotOk) { throw "Origin plotxy failed" }
 }
 
@@ -944,6 +1000,7 @@ try {
       $originProcName = ''
       try { $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath) } catch { $originProcName = '' }
 
+      $launchedUi = $false
       if (-not (Test-OriginUiRunning $originExePath)) {
         try {
           $originWorkDir = ''
@@ -955,6 +1012,7 @@ try {
             Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath"
             Start-Process -FilePath $originExePath | Out-Null
           }
+          $launchedUi = $true
         } catch {
           Write-OriginBridgeLog "Launching Origin UI failed (will still try COM). $($_.Exception.Message)"
         }
@@ -968,6 +1026,12 @@ try {
         Write-OriginBridgeLog "Origin UI wait before COM attach: $($uiSw.ElapsedMilliseconds) ms (running=$((Test-OriginUiRunning $originExePath)))"
       } else {
         Write-OriginBridgeLog "UI automation enabled; Origin UI already running."
+      }
+
+      if ($launchedUi) {
+        # Give Origin time to finish initializing COM inside the UI process.
+        # Attaching too early can spawn a second hidden -Embedding process.
+        Start-Sleep -Milliseconds 3000
       }
 
       $attachSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1079,6 +1143,17 @@ try {
     Write-OriginBridgeLog "UI automation mode: OFF (use standalone COM instance; will Save() + Exit() + relaunch Origin UI). Set ORIGINBRIDGE_UI_AUTOMATION=1 to enable."
   }
 
+  # Serialize Origin automation across jobs: selecting multiple ZIPs starts multiple workers.
+  # Without a lock, concurrent COM commands can race and break (e.g. plotxy fails).
+  $originLock = $null
+  try {
+    $originLock = Acquire-OriginAutomationLock 600000
+    Write-OriginBridgeLog "Origin automation lock acquired."
+  } catch {
+    Write-OriginBridgeLog "Failed to acquire Origin automation lock. $($_.Exception.Message)"
+    throw
+  }
+
   try {
     $comSw = [System.Diagnostics.Stopwatch]::StartNew()
     $originInfo = New-OriginComObject $preferUiAutomation
@@ -1148,9 +1223,6 @@ try {
   $fallbackNewBook = $true
   if (-not $attachedToUiInstance) {
     # Fresh standalone automation instance; keep the project clean (avoid extra empty books).
-    $fallbackNewBook = $false
-  } elseif (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
-    # UI automation: avoid creating an extra empty book in the user's workspace.
     $fallbackNewBook = $false
   }
 
@@ -1322,6 +1394,7 @@ try {
       $ws = New-Object -ComObject 'WScript.Shell'
       $null = $ws.AppActivate('Origin')
     } catch {}
+    try { $origin.EndSession() | Out-Null } catch {}
     Start-OriginBridgeCleanup $WorkDir $projPath ''
     try { Release-ComObject $origin } catch {}
     $origin = $null

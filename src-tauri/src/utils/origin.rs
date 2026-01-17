@@ -705,14 +705,23 @@ function Invoke-OriginOgs([__ComObject]$origin, [string]$ogsPath, [string]$csvPa
   return $false
 }
 
-function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath) {
+function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath, [bool]$createNewBook = $true) {
   if (-not $csvPath) { throw "No usable .csv found in package" }
 
   # Import CSV using the absolute path; relative paths are not reliable in Origin automation.
   $csvLt = Escape-LabTalkPath $csvPath
-  $importCmd = 'newbook; impCSV fname:="' + $csvLt + '";'
-  Write-OriginBridgeLog "Importing CSV: $csvPath"
+  $importCmd = ''
+  if ($createNewBook) {
+    $importCmd = 'newbook; impCSV fname:="' + $csvLt + '";'
+  } else {
+    $importCmd = 'impCSV fname:="' + $csvLt + '";'
+  }
+  Write-OriginBridgeLog "Importing CSV: $csvPath (newbook=$createNewBook)"
   $importOk = $origin.Execute($importCmd)
+  if ((-not $importOk) -and (-not $createNewBook)) {
+    Write-OriginBridgeLog "impCSV failed without newbook; retrying with newbook."
+    $importOk = $origin.Execute('newbook; impCSV fname:="' + $csvLt + '";')
+  }
   if (-not $importOk) { throw "Origin impCSV failed" }
 
   # Build plotxy mapping from CSV header: x1,y1,x2,y2,... -> (1,2) (3,4) ...
@@ -929,22 +938,78 @@ try {
     $lastError = $null
 
     if ($preferUi) {
-      # When we want UI automation, Origin's main window may appear before its COM server
-      # is fully ready. Retry attaching to the UI instance (ApplicationSI) for a while
-      # before falling back to creating a new automation instance.
+      # UI automation: ensure Origin UI is running and attach to that instance.
+      # Important: If we attach too early after launching Origin, COM may spawn a second hidden
+      # Origin process (-Embedding). Detect that case, terminate the extra process, and retry.
+      $originProcName = ''
+      try { $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath) } catch { $originProcName = '' }
+
+      if (-not (Test-OriginUiRunning $originExePath)) {
+        try {
+          $originWorkDir = ''
+          try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
+          if ($originWorkDir) {
+            Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath (cwd: $originWorkDir)"
+            Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
+          } else {
+            Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath"
+            Start-Process -FilePath $originExePath | Out-Null
+          }
+        } catch {
+          Write-OriginBridgeLog "Launching Origin UI failed (will still try COM). $($_.Exception.Message)"
+        }
+
+        $uiSw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($uiSw.ElapsedMilliseconds -lt 20000) {
+          if (Test-OriginUiRunning $originExePath) { break }
+          Start-Sleep -Milliseconds 300
+        }
+        $uiSw.Stop()
+        Write-OriginBridgeLog "Origin UI wait before COM attach: $($uiSw.ElapsedMilliseconds) ms (running=$((Test-OriginUiRunning $originExePath)))"
+      } else {
+        Write-OriginBridgeLog "UI automation enabled; Origin UI already running."
+      }
+
       $attachSw = [System.Diagnostics.Stopwatch]::StartNew()
       while ($attachSw.ElapsedMilliseconds -lt 20000) {
+        $before = @()
+        try { if ($originProcName) { $before = @(Get-Process -Name $originProcName -ErrorAction SilentlyContinue) } } catch { $before = @() }
+        $beforeIds = @()
+        try { $beforeIds = @($before | ForEach-Object { $_.Id }) } catch { $beforeIds = @() }
+
         try {
           $progId = 'Origin.ApplicationSI'
-          Write-Host "Trying Origin COM ProgID (attach UI): $progId"
+          Write-Host "Trying Origin COM ProgID (UI attach): $progId"
           $obj = New-Object -ComObject $progId
+
+          $after = @()
+          try { if ($originProcName) { $after = @(Get-Process -Name $originProcName -ErrorAction SilentlyContinue) } } catch { $after = @() }
+          $newProcs = @()
+          try { $newProcs = @($after | Where-Object { $beforeIds -notcontains $_.Id }) } catch { $newProcs = @() }
+          $newHidden = @()
+          try { $newHidden = @($newProcs | Where-Object { $_.MainWindowHandle -eq 0 }) } catch { $newHidden = @() }
+
+          if ($newHidden.Count -gt 0) {
+            Write-OriginBridgeLog "COM attach spawned extra Origin process(es) (likely -Embedding). Waiting for UI COM readiness and retrying."
+            try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($obj) } catch {}
+            $obj = $null
+            foreach ($p in $newHidden) {
+              try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            Start-Sleep -Milliseconds 700
+            continue
+          }
+
           return @{ ProgId = $progId; Object = $obj }
         } catch {
           $lastError = $_
           Start-Sleep -Milliseconds 300
         }
       }
-      Write-Host "UI attach timed out; falling back to new automation instance."
+
+      $msg = "Could not attach to Origin UI COM instance (ApplicationSI). Please start Origin manually and retry."
+      if ($lastError) { $msg = "$msg`nLast error: $($lastError.Exception.Message)" }
+      throw $msg
     }
 
     # Default: prefer a dedicated automation instance so we don't attach to (and accidentally
@@ -1014,33 +1079,6 @@ try {
     Write-OriginBridgeLog "UI automation mode: OFF (use standalone COM instance; will Save() + Exit() + relaunch Origin UI). Set ORIGINBRIDGE_UI_AUTOMATION=1 to enable."
   }
 
-  if ($preferUiAutomation) {
-    if (-not (Test-OriginUiRunning $originExePath)) {
-      try {
-        $originWorkDir = ''
-        try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
-        if ($originWorkDir) {
-          Write-OriginBridgeLog "UI automation enabled; pre-launching Origin UI: $originExePath (cwd: $originWorkDir)"
-          Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
-        } else {
-          Write-OriginBridgeLog "UI automation enabled; pre-launching Origin UI: $originExePath"
-          Start-Process -FilePath $originExePath | Out-Null
-        }
-      } catch {
-        Write-OriginBridgeLog "Pre-launch Origin UI failed (will still try COM). $($_.Exception.Message)"
-      }
-
-      $uiSw = [System.Diagnostics.Stopwatch]::StartNew()
-      while ($uiSw.ElapsedMilliseconds -lt 20000) {
-        if (Test-OriginUiRunning $originExePath) { break }
-        Start-Sleep -Milliseconds 300
-      }
-      $uiSw.Stop()
-      Write-OriginBridgeLog "Origin UI detection wait: $($uiSw.ElapsedMilliseconds) ms (running=$((Test-OriginUiRunning $originExePath)))"
-    } else {
-      Write-OriginBridgeLog "UI automation enabled; Origin UI already running."
-    }
-  }
   try {
     $comSw = [System.Diagnostics.Stopwatch]::StartNew()
     $originInfo = New-OriginComObject $preferUiAutomation
@@ -1050,7 +1088,7 @@ try {
     $attachedToUiInstance = ($originProgId -eq 'Origin.ApplicationSI')
     Write-OriginBridgeLog "Origin COM created in $($comSw.ElapsedMilliseconds) ms. ProgID: $originProgId"
     if ($attachedToUiInstance) {
-      Write-OriginBridgeLog "Origin COM attached to existing UI instance (ApplicationSI); will NOT call Exit()."
+      Write-OriginBridgeLog "Origin COM is ApplicationSI (single instance); will NOT call Exit()."
     }
   } catch {
     $comErr = $_.Exception.Message
@@ -1089,12 +1127,11 @@ try {
   }
 
   # NOTE:
-  # Origin COM automation typically launches a headless Origin instance.
-  # Instead of trying to show that instance, we:
-  # 1) import + plot inside the automation instance
-  # 2) save the project to an .opju file
-  # 3) launch normal Origin UI to open the saved .opju (so the user sees the plot)
-  if (-not $attachedToUiInstance) {
+  # - UI automation mode: show the COM instance UI and keep Origin running (no Exit()/relaunch).
+  # - Non-UI mode: keep the automation instance hidden, Save() to .opju, Exit(), then relaunch UI to open the .opju.
+  if (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
+    try { $origin.Visible = $true } catch {}
+  } elseif (-not $attachedToUiInstance) {
     $origin.Visible = $false
   }
   $beginSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1106,6 +1143,15 @@ try {
     try { $origin.NewProject() | Out-Null } catch {}
     $newProjSw.Stop()
     Write-OriginBridgeLog "Origin NewProject() took $($newProjSw.ElapsedMilliseconds) ms"
+  }
+
+  $fallbackNewBook = $true
+  if (-not $attachedToUiInstance) {
+    # Fresh standalone automation instance; keep the project clean (avoid extra empty books).
+    $fallbackNewBook = $false
+  } elseif (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
+    # UI automation: avoid creating an extra empty book in the user's workspace.
+    $fallbackNewBook = $false
   }
 
   $ranOgs = $false
@@ -1202,7 +1248,7 @@ try {
     # Fallback: Import CSV + plot raw column pairs.
     # This is less accurate than the mode-specific OGS script, but keeps compatibility.
     $csvFallbackSw = [System.Diagnostics.Stopwatch]::StartNew()
-    Invoke-FallbackCsvPlot $origin $csvPath
+    Invoke-FallbackCsvPlot $origin $csvPath $fallbackNewBook
     $csvFallbackSw.Stop()
     Write-OriginBridgeLog "Fallback CSV plot took $($csvFallbackSw.ElapsedMilliseconds) ms"
   }
@@ -1252,7 +1298,7 @@ try {
     if (-not $attachedToUiInstance) {
       try { $origin.NewProject() | Out-Null } catch {}
     }
-    Invoke-FallbackCsvPlot $origin $csvPath
+    Invoke-FallbackCsvPlot $origin $csvPath $fallbackNewBook
 
     if (Test-Path -LiteralPath $projPath) {
       try { Remove-Item -Force -LiteralPath $projPath } catch {}
@@ -1269,7 +1315,8 @@ try {
     }
   }
 
-  if ($attachedToUiInstance -and (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) {
+  if (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
+    try { $origin.Visible = $true } catch {}
     try { $origin.Execute('win -a;') | Out-Null } catch {}
     try {
       $ws = New-Object -ComObject 'WScript.Shell'

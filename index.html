@@ -22,6 +22,14 @@
         'Courier New', monospace;
     }
 
+    #pickedZipPath {
+      display: inline-block;
+      max-width: min(720px, 100%);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      vertical-align: top;
+    }
+
     .card {
       max-width: 860px;
       border: 1px solid rgba(127, 127, 127, 0.25);
@@ -117,7 +125,7 @@
   <div class="card">
 
 
-    <div id="status" class="status">Loading...</div>
+
 
     <h2>Origin路径选择</h2>
 
@@ -135,10 +143,12 @@
     <h2>ZIP 处理</h2>
 
     <div class="row" style="margin-top: 10px">
-      <button id="pickZipBtn">选择 ZIP</button>
+      <button id="pickZipBtn">选择 ZIP（可多选）</button>
       <button id="extractZipBtn">打开origin</button>
       <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
     </div>
+
+    <div id="status" class="status">Loading...</div>
   </div>
 
   <script type="module">
@@ -158,8 +168,24 @@
     const extractZipBtn = document.getElementById('extractZipBtn')
     const pickedZipPathEl = document.getElementById('pickedZipPath')
 
-    let pickedZipPath = ''
+    let pickedZipPaths = []
     let isBusy = false
+
+    function normalizePickedPaths(selected) {
+      if (!selected) return []
+      if (Array.isArray(selected))
+        return selected.map((p) => String(p || '').trim()).filter(Boolean)
+      return [String(selected || '').trim()].filter(Boolean)
+    }
+
+    function formatPickedPathsForInline(paths) {
+      const list = Array.isArray(paths) ? paths : []
+      if (!list.length) return '(未选择)'
+      if (list.length === 1) return list[0]
+      const shown = list.slice(0, 3).join('\n')
+      const suffix = list.length > 3 ? `\n…等 ${list.length} 个` : `\n共 ${list.length} 个`
+      return shown + suffix
+    }
 
     function setBusy(v) {
       isBusy = Boolean(v)
@@ -173,7 +199,7 @@
       ])
         el.disabled = isBusy
 
-      if (!isBusy) extractZipBtn.disabled = !pickedZipPath
+      if (!isBusy) extractZipBtn.disabled = !pickedZipPaths.length
     }
 
     function setStatus(msg, isError = false) {
@@ -181,10 +207,10 @@
       statusEl.classList.toggle('error', Boolean(isError))
     }
 
-    function setPickedZipPath(p) {
-      pickedZipPath = (p || '').trim()
-      pickedZipPathEl.textContent = pickedZipPath || '(未选择)'
-      if (!isBusy) extractZipBtn.disabled = !pickedZipPath
+    function setPickedZipPaths(paths) {
+      pickedZipPaths = normalizePickedPaths(paths)
+      pickedZipPathEl.textContent = formatPickedPathsForInline(pickedZipPaths)
+      if (!isBusy) extractZipBtn.disabled = !pickedZipPaths.length
     }
 
     function getOriginExePath() {
@@ -316,18 +342,19 @@
       try {
         const selected = await open({
           directory: false,
-          multiple: false,
-          title: '选择要解压的 ZIP',
+          multiple: true,
+          title: '选择要解压的 ZIP（可多选）',
           filters: [{ name: 'ZIP', extensions: ['zip'] }],
         })
 
-        if (!selected) {
+        const list = normalizePickedPaths(selected)
+        if (!list.length) {
           setStatus('未选择 ZIP。')
           return
         }
 
-        setPickedZipPath(selected)
-        setStatus(`已选择 ZIP：${selected}`)
+        setPickedZipPaths(list)
+        setStatus(`已选择 ZIP：${list.length} 个\n` + list.join('\n'))
       } catch (e) {
         setStatus(String(e?.message || e), true)
       } finally {
@@ -346,22 +373,37 @@
         return
       }
 
-      if (!pickedZipPath) {
+      if (!pickedZipPaths.length) {
         await pickZipForExtract()
-        if (!pickedZipPath) return
+        if (!pickedZipPaths.length) return
       }
 
       setBusy(true)
       try {
-        const result = await invoke('extract_zip_and_open_origin', { zipPath: pickedZipPath })
-        const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
-        const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
-        const errHint = result?.errorPath ? `\n错误文件: ${result.errorPath}` : ''
+        const results = []
+        const zips = pickedZipPaths.slice()
+
+        for (let i = 0; i < zips.length; i++) {
+          const zipPath = zips[i]
+          setStatus(`(${i + 1}/${zips.length}) 正在启动出图任务…\nZIP: ${zipPath}`)
+
+          try {
+            const result = await invoke('extract_zip_and_open_origin', { zipPath })
+            const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
+            const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
+            const errHint = result?.errorPath ? `\n错误文件: ${result.errorPath}` : ''
+            results.push(
+              `已解压并启动出图任务。\nZIP: ${zipPath}\n解压目录: ${result.extractDir}\nOGS: ${ogsCount ? `${ogsCount} 个` : '未找到'}${logHint}${errHint}`
+            )
+          } catch (e) {
+            results.push(`启动失败。\nZIP: ${zipPath}\n错误: ${String(e?.message || e)}`)
+          }
+        }
+
         setStatus(
-          `已解压并启动出图任务。\nZIP: ${pickedZipPath}\n解压目录: ${result.extractDir}\nOGS: ${ogsCount ? `${ogsCount} 个` : '未找到'}${logHint}${errHint}\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。`
+          results.join('\n\n') +
+          '\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。\n\n提示：成功后会自动清理工作/日志文件夹（在你关闭已打开的 .opju 之后）。如需保留排查日志，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
         )
-        statusEl.textContent +=
-          '\n\n提示：成功后会自动清理工作/日志文件夹（在你关闭已打开的 .opju 之后）。如需保留排查日志，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
       } catch (e) {
         setStatus(String(e?.message || e), true)
       } finally {
@@ -380,7 +422,7 @@
       if (v) originExeEl.value = v
     })
 
-    setPickedZipPath('')
+    setPickedZipPaths([])
     refreshOriginExePath().finally(() => {
       if (!getOriginExePath()) setStatus('请先配置 Origin 可执行文件路径。', true)
       else setStatus('就绪。')

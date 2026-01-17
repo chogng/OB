@@ -717,8 +717,7 @@ try {
     }
     Write-OriginBridgeLog "Using pre-extracted package dir: $pkgDir"
   } else {
-    $pkgDir = Join-Path $WorkDir 'pkg'
-    New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+    $pkgDir = $WorkDir
 
     if (-not $local) { throw "Local ZIP path is empty" }
     if ($local -match '(?i)\\.crdownload$') {
@@ -750,16 +749,49 @@ try {
     Expand-Archive -Path $zipPath -DestinationPath $pkgDir -Force
   }
 
-  $ogs = Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.ogs | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  # Keep the extracted folder clean:
+  # - Save Origin project alongside .ob (parent directory).
+  # - Move package files (manifest/readme/csv/ogs/etc.) into .ob so they stay together with logs.
+  $pkgSourceDir = $pkgDir
+  if ($pre) {
+    $pkgSourceDir = $pkgDir
+    $pkgDir = $WorkDir
+  }
+  if ($pkgSourceDir -and (Test-Path -LiteralPath $pkgSourceDir) -and ($pkgDir -ne $pkgSourceDir)) {
+    try {
+      $srcFiles = Get-ChildItem -LiteralPath $pkgSourceDir -File -Force -ErrorAction SilentlyContinue
+      foreach ($f in $srcFiles) {
+        if (-not $f) { continue }
+        if ($f.Extension -ieq '.opju' -or $f.Extension -ieq '.opj') { continue }
+        $dest = Join-Path $pkgDir $f.Name
+        if ($f.FullName -ieq $dest) { continue }
+        try {
+          Move-Item -Force -LiteralPath $f.FullName -Destination $dest -ErrorAction Stop
+        } catch {
+          try { Copy-Item -Force -LiteralPath $f.FullName -Destination $dest -ErrorAction Stop } catch {}
+          try { Remove-Item -Force -LiteralPath $f.FullName -ErrorAction SilentlyContinue } catch {}
+        }
+      }
+      Write-OriginBridgeLog "Relocated package files into WorkDir: $pkgDir"
+    } catch {
+      Write-OriginBridgeLog "Relocate package files failed: $($_.Exception.Message)"
+    }
+  }
+
+  $ogs = Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.ogs |
+    Where-Object { $_.Name -notmatch '^originbridge_job\\.ogs$' } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
   $csvCandidates = @(
     Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.csv |
-      Where-Object { $_.Name -notmatch 'metrics' }
+      Where-Object { $_.Name -notmatch 'metrics' -and $_.Name -notmatch '^originbridge_job\\.csv$' }
   )
 
   if ($csvCandidates.Count -eq 0) {
     $csvCandidates = @(
-      Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.csv
+      Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.csv |
+        Where-Object { $_.Name -notmatch '^originbridge_job\\.csv$' }
     )
   }
 
@@ -1030,7 +1062,10 @@ try {
   }
 
   $projName = "originbridge.opju"
-  $projPath = Join-Path $WorkDir $projName
+  $saveRoot = ''
+  try { $saveRoot = Split-Path -Parent $WorkDir } catch { $saveRoot = '' }
+  if (-not $saveRoot) { $saveRoot = $WorkDir }
+  $projPath = Join-Path $saveRoot $projName
 
   if (Test-Path -LiteralPath $projPath) {
     try { Remove-Item -Force -LiteralPath $projPath } catch {}

@@ -126,14 +126,14 @@ pub fn extract_zip_and_launch_origin(
         }
     };
 
-    // Create extract directory: work_root/extracted_{zip_name}
+    // Create extract directory: work_root/Extract/{zip_name}
     let name_hint = zip_full
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("origin_package");
     let name_hint = sanitize_path_component(name_hint);
-    let base_extract_dir = work_root.join(format!("extracted_{name_hint}"));
+    let base_extract_dir = work_root.join("Extract").join(name_hint.clone());
     let mut extract_dir = base_extract_dir.clone();
 
     // Overwrite any previous extracted folder for this ZIP name.
@@ -146,8 +146,9 @@ pub fn extract_zip_and_launch_origin(
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                extract_dir = work_root.join(format!("extracted_{name_hint}_{ts}"));
+                extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
             }
+
         } else {
             return Err(format!(
                 "Extract dir path exists but is not a directory: {}",
@@ -170,7 +171,7 @@ pub fn extract_zip_and_launch_origin(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            extract_dir = work_root.join(format!("extracted_{name_hint}_{ts}"));
+            extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
         }
     }
 

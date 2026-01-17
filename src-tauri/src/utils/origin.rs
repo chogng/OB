@@ -329,6 +329,13 @@ pub fn extract_zip_and_launch_origin(
         c
     };
 
+    // Default to reusing a single Origin UI instance for automation to avoid the
+    // expensive Origin COM shutdown path (EndSession/Exit/Release) on every job.
+    // Users can opt out by setting ORIGINBRIDGE_UI_AUTOMATION=0/false in the app env.
+    if std::env::var_os("ORIGINBRIDGE_UI_AUTOMATION").is_none() {
+        cmd.env("ORIGINBRIDGE_UI_AUTOMATION", "1");
+    }
+
     let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
     final_args.extend(args);
 
@@ -486,8 +493,12 @@ function Release-ComObject($obj) {
   } catch {
     # ignore
   }
-  [GC]::Collect()
-  [GC]::WaitForPendingFinalizers()
+  if (Test-EnvTruthy $env:ORIGINBRIDGE_AGGRESSIVE_COM_GC) {
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+  }
 }
 
 function Wait-FileUnlocked([string]$path, [int]$timeoutMs = 10000) {
@@ -515,6 +526,10 @@ function Test-EnvTruthy([string]$value) {
 }
 
 function Start-OriginBridgeCleanup([string]$workDir, [string]$projectPath, [string]$traceDir) {
+  if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_ENABLE_CLEANUP)) {
+    Write-OriginBridgeLog "Cleanup disabled by default. Set ORIGINBRIDGE_ENABLE_CLEANUP=1 to enable."
+    return
+  }
   if ((Test-EnvTruthy $env:ORIGINBRIDGE_KEEP_WORK) -or (Test-EnvTruthy $env:ORIGINBRIDGE_KEEP_TEMP) -or (Test-EnvTruthy $env:ORIGINBRIDGE_KEEP_ARTIFACTS)) {
     Write-OriginBridgeLog "Cleanup disabled via ORIGINBRIDGE_KEEP_WORK/ORIGINBRIDGE_KEEP_TEMP."
     return
@@ -527,7 +542,7 @@ param(
   [int]$ParentPid,
   [string]$WorkDir,
   [string]$ProjectPath,
-  [string]$TraceDir
+  [string]$TraceDir = ''
 )
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -595,15 +610,26 @@ try {
     if ($null -eq $workDirSafe) { $workDirSafe = '' }
     if ($null -eq $projectPathSafe) { $projectPathSafe = '' }
     if ($null -eq $traceDirSafe) { $traceDirSafe = '' }
-    Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+    if (-not $workDirSafe) {
+      Write-OriginBridgeLog "Cleanup skipped: WorkDir is empty."
+      return
+    }
+    if (-not $projectPathSafe) {
+      Write-OriginBridgeLog "Cleanup skipped: ProjectPath is empty."
+      return
+    }
+
+    $args = @(
       '-NoProfile',
       '-ExecutionPolicy', 'Bypass',
       '-Command', $cleanupCmd,
       [string]$parentPid,
       $workDirSafe,
-      $projectPathSafe,
-      $traceDirSafe
-    ) | Out-Null
+      $projectPathSafe
+    )
+    if ($traceDirSafe) { $args += $traceDirSafe }
+
+    Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList $args | Out-Null
     Write-OriginBridgeLog "Scheduled cleanup for WorkDir (will run after Origin closes project)."
   } catch {
     Write-OriginBridgeLog "Failed to schedule cleanup. $($_.Exception.Message)"
@@ -899,17 +925,37 @@ try {
     }
   }
 
-  function New-OriginComObject {
-    # Prefer non-SI automation instance so we don't attach to (and accidentally close)
-    # an already running Origin UI instance.
+  function New-OriginComObject([bool]$preferUi = $false) {
+    $lastError = $null
+
+    if ($preferUi) {
+      # When we want UI automation, Origin's main window may appear before its COM server
+      # is fully ready. Retry attaching to the UI instance (ApplicationSI) for a while
+      # before falling back to creating a new automation instance.
+      $attachSw = [System.Diagnostics.Stopwatch]::StartNew()
+      while ($attachSw.ElapsedMilliseconds -lt 20000) {
+        try {
+          $progId = 'Origin.ApplicationSI'
+          Write-Host "Trying Origin COM ProgID (attach UI): $progId"
+          $obj = New-Object -ComObject $progId
+          return @{ ProgId = $progId; Object = $obj }
+        } catch {
+          $lastError = $_
+          Start-Sleep -Milliseconds 300
+        }
+      }
+      Write-Host "UI attach timed out; falling back to new automation instance."
+    }
+
+    # Default: prefer a dedicated automation instance so we don't attach to (and accidentally
+    # close) an already running Origin UI instance unless explicitly requested.
     $progIds = @('Origin.Application', 'Origin.ApplicationSI')
-    if (Test-OriginUiRunning $originExePath) {
+    if ((-not $preferUi) -and (Test-OriginUiRunning $originExePath)) {
       # If UI is already running, prefer attaching to it so we create a new workbook/graph
       # window inside the existing instance (avoids hitting instance limits and preserves
       # the user's current Origin session).
       $progIds = @('Origin.ApplicationSI', 'Origin.Application')
     }
-    $lastError = $null
     foreach ($progId in $progIds) {
       try {
         Write-Host "Trying Origin COM ProgID: $progId"
@@ -961,11 +1007,48 @@ try {
   $origin = $null
   $originProgId = ''
   $attachedToUiInstance = $false
+  $preferUiAutomation = Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION
+  if ($preferUiAutomation) {
+    Write-OriginBridgeLog "UI automation mode: ON (use Origin UI instance; keep Origin running; no Exit()/relaunch). Set ORIGINBRIDGE_UI_AUTOMATION=0 to disable."
+  } else {
+    Write-OriginBridgeLog "UI automation mode: OFF (use standalone COM instance; will Save() + Exit() + relaunch Origin UI). Set ORIGINBRIDGE_UI_AUTOMATION=1 to enable."
+  }
+
+  if ($preferUiAutomation) {
+    if (-not (Test-OriginUiRunning $originExePath)) {
+      try {
+        $originWorkDir = ''
+        try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
+        if ($originWorkDir) {
+          Write-OriginBridgeLog "UI automation enabled; pre-launching Origin UI: $originExePath (cwd: $originWorkDir)"
+          Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
+        } else {
+          Write-OriginBridgeLog "UI automation enabled; pre-launching Origin UI: $originExePath"
+          Start-Process -FilePath $originExePath | Out-Null
+        }
+      } catch {
+        Write-OriginBridgeLog "Pre-launch Origin UI failed (will still try COM). $($_.Exception.Message)"
+      }
+
+      $uiSw = [System.Diagnostics.Stopwatch]::StartNew()
+      while ($uiSw.ElapsedMilliseconds -lt 20000) {
+        if (Test-OriginUiRunning $originExePath) { break }
+        Start-Sleep -Milliseconds 300
+      }
+      $uiSw.Stop()
+      Write-OriginBridgeLog "Origin UI detection wait: $($uiSw.ElapsedMilliseconds) ms (running=$((Test-OriginUiRunning $originExePath)))"
+    } else {
+      Write-OriginBridgeLog "UI automation enabled; Origin UI already running."
+    }
+  }
   try {
-    $originInfo = New-OriginComObject
+    $comSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $originInfo = New-OriginComObject $preferUiAutomation
+    $comSw.Stop()
     $originProgId = $originInfo.ProgId
     $origin = $originInfo.Object
     $attachedToUiInstance = ($originProgId -eq 'Origin.ApplicationSI')
+    Write-OriginBridgeLog "Origin COM created in $($comSw.ElapsedMilliseconds) ms. ProgID: $originProgId"
     if ($attachedToUiInstance) {
       Write-OriginBridgeLog "Origin COM attached to existing UI instance (ApplicationSI); will NOT call Exit()."
     }
@@ -1014,9 +1097,15 @@ try {
   if (-not $attachedToUiInstance) {
     $origin.Visible = $false
   }
+  $beginSw = [System.Diagnostics.Stopwatch]::StartNew()
   $origin.BeginSession() | Out-Null
+  $beginSw.Stop()
+  Write-OriginBridgeLog "Origin BeginSession() took $($beginSw.ElapsedMilliseconds) ms"
   if (-not $attachedToUiInstance) {
+    $newProjSw = [System.Diagnostics.Stopwatch]::StartNew()
     try { $origin.NewProject() | Out-Null } catch {}
+    $newProjSw.Stop()
+    Write-OriginBridgeLog "Origin NewProject() took $($newProjSw.ElapsedMilliseconds) ms"
   }
 
   $ranOgs = $false
@@ -1025,7 +1114,10 @@ try {
   $ogsUsesArg = $false
   if ($ogs) {
     try {
+      $readOgsSw = [System.Diagnostics.Stopwatch]::StartNew()
       $ogsText = Get-Content -LiteralPath $ogs.FullName -Raw -ErrorAction Stop
+      $readOgsSw.Stop()
+      Write-OriginBridgeLog "Read OGS text took $($readOgsSw.ElapsedMilliseconds) ms"
       if ($ogsText -match '(?i)\bdlgfile\b') { $ogsHasDlgFile = $true }
       if ($ogsText -match '%1') { $ogsUsesArg = $true }
     } catch {
@@ -1109,7 +1201,10 @@ try {
   if (-not $ranOgs) {
     # Fallback: Import CSV + plot raw column pairs.
     # This is less accurate than the mode-specific OGS script, but keeps compatibility.
+    $csvFallbackSw = [System.Diagnostics.Stopwatch]::StartNew()
     Invoke-FallbackCsvPlot $origin $csvPath
+    $csvFallbackSw.Stop()
+    Write-OriginBridgeLog "Fallback CSV plot took $($csvFallbackSw.ElapsedMilliseconds) ms"
   }
 
   if ($attachedToUiInstance) {
@@ -1119,10 +1214,13 @@ try {
       $ws = New-Object -ComObject 'WScript.Shell'
       $null = $ws.AppActivate('Origin')
     } catch {}
-    Write-OriginBridgeLog "Attached to existing Origin UI instance; created windows in current workspace. Skipping Save()/Exit()."
-    try { Release-ComObject $origin } catch {}
-    $origin = $null
-    exit 0
+    if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) {
+      Write-OriginBridgeLog "Attached to existing Origin UI instance; created windows in current workspace. Skipping Save()/Exit()."
+      try { Release-ComObject $origin } catch {}
+      $origin = $null
+      exit 0
+    }
+    Write-OriginBridgeLog "UI automation enabled; will Save() and keep Origin open (no Exit()/relaunch)."
   }
 
   $projName = "originbridge.opju"
@@ -1136,13 +1234,19 @@ try {
   }
 
   Write-OriginBridgeLog "Saving Origin project: $projPath"
+  $saveSw = [System.Diagnostics.Stopwatch]::StartNew()
   $saved = $origin.Save($projPath)
+  $saveSw.Stop()
+  Write-OriginBridgeLog "Origin Save() took $($saveSw.ElapsedMilliseconds) ms (ok=$saved)"
   if (-not $saved) { throw "Origin Save() returned false" }
 
   # Some Origin automation commands return success even when they fail silently.
   # Validate the project contains at least one graph page after Save(). If not, re-run fallback plotting.
   $searchAfterSave = ''
+  $searchSw = [System.Diagnostics.Stopwatch]::StartNew()
   try { $searchAfterSave = $origin.ProjectSearch('G', $null, $null) } catch {}
+  $searchSw.Stop()
+  Write-OriginBridgeLog "Origin ProjectSearch('G') took $($searchSw.ElapsedMilliseconds) ms"
   if ($searchAfterSave -notmatch 'GraphPage') {
     Write-OriginBridgeLog "No GraphPage found after Save(); attempting fallback CSV plot."
     if (-not $attachedToUiInstance) {
@@ -1165,13 +1269,52 @@ try {
     }
   }
 
+  if ($attachedToUiInstance -and (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) {
+    try { $origin.Execute('win -a;') | Out-Null } catch {}
+    try {
+      $ws = New-Object -ComObject 'WScript.Shell'
+      $null = $ws.AppActivate('Origin')
+    } catch {}
+    Start-OriginBridgeCleanup $WorkDir $projPath ''
+    try { Release-ComObject $origin } catch {}
+    $origin = $null
+    exit 0
+  }
+
   # Close the automation instance, then open the saved project in a real UI window.
+  $endSw = [System.Diagnostics.Stopwatch]::StartNew()
   try { $origin.EndSession() | Out-Null } catch {}
+  $endSw.Stop()
+  Write-OriginBridgeLog "Origin EndSession() took $($endSw.ElapsedMilliseconds) ms"
+
+  $exitSw = [System.Diagnostics.Stopwatch]::StartNew()
   try { $origin.Exit() | Out-Null } catch {}
+  $exitSw.Stop()
+  Write-OriginBridgeLog "Origin Exit() took $($exitSw.ElapsedMilliseconds) ms"
+
+  $releaseSw = [System.Diagnostics.Stopwatch]::StartNew()
   try { Release-ComObject $origin } catch {}
+  $releaseSw.Stop()
+  Write-OriginBridgeLog "Release COM took $($releaseSw.ElapsedMilliseconds) ms"
   $origin = $null
 
-  $unlocked = Wait-FileUnlocked $projPath 60000
+  $unlockWaitMs = 60000
+  try {
+    $raw = [string]$env:ORIGINBRIDGE_UNLOCK_WAIT_MS
+    if ($raw) {
+      $v = 0
+      if ([int]::TryParse($raw.Trim(), [ref]$v)) {
+        if ($v -lt 0) { $v = 0 }
+        if ($v -gt 600000) { $v = 600000 }
+        $unlockWaitMs = $v
+      }
+    }
+  } catch {}
+
+  $unlockSw = [System.Diagnostics.Stopwatch]::StartNew()
+  $unlocked = Wait-FileUnlocked $projPath $unlockWaitMs
+  $unlockSw.Stop()
+  Write-OriginBridgeLog "Wait-FileUnlocked took $($unlockSw.ElapsedMilliseconds) ms (timeout=$unlockWaitMs, ok=$unlocked)"
   if (-not $unlocked) {
     Write-OriginBridgeLog "Project file still locked after waiting: $projPath"
   }
@@ -1183,6 +1326,7 @@ try {
   $originWorkDir = ''
   try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
   try {
+    $openUiSw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($originWorkDir) {
       Write-OriginBridgeLog "Opening project in Origin UI: $originExePath (cwd: $originWorkDir) $projPath"
       Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir -ArgumentList @($projPath) | Out-Null
@@ -1190,6 +1334,8 @@ try {
       Write-OriginBridgeLog "Opening project in Origin UI: $originExePath $projPath"
       Start-Process -FilePath $originExePath -ArgumentList @($projPath) | Out-Null
     }
+    $openUiSw.Stop()
+    Write-OriginBridgeLog "Start-Process (Origin UI) returned in $($openUiSw.ElapsedMilliseconds) ms"
   } catch {
     Write-OriginBridgeLog "Start-Process Origin UI failed; falling back to file association. $($_.Exception.Message)"
     Start-Process -FilePath $projPath | Out-Null

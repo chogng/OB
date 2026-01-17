@@ -414,7 +414,7 @@
 
         setStatus(
           results.join('\n\n') +
-          '\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。\n\n提示：成功后会自动清理工作/日志文件夹（在你关闭已打开的 .opju 之后）。如需保留排查日志，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
+          '\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
         )
       } catch (e) {
         setStatus(String(e?.message || e), true)

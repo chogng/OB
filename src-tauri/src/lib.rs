@@ -37,11 +37,14 @@ fn detect_origin_exe_candidates(deep_scan: Option<bool>) -> Result<serde_json::V
 fn extract_zip_and_open_origin(
     zip_path: String,
     save_path: Option<String>,
+    reuse_origin_ui: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let zip_path = zip_path.trim();
     if zip_path.is_empty() {
         return Err("ZIP path is empty".to_string());
     }
+
+    let reuse_origin_ui = reuse_origin_ui.unwrap_or(true);
 
     #[cfg(target_os = "windows")]
     {
@@ -68,6 +71,7 @@ fn extract_zip_and_open_origin(
             std::path::Path::new(zip_path),
             &origin_exe,
             save_path,
+            reuse_origin_ui,
         )
         .map_err(|e| format!("Failed to extract and open: {e}"))?;
         return Ok(result);

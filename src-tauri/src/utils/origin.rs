@@ -103,6 +103,7 @@ pub fn extract_zip_and_launch_origin(
     zip_path: &std::path::Path,
     origin_exe: &std::path::Path,
     save_path: Option<String>,
+    reuse_origin_ui: bool,
 ) -> Result<serde_json::Value, String> {
     use std::fs;
 
@@ -345,12 +346,16 @@ pub fn extract_zip_and_launch_origin(
         c
     };
 
-    // Default to reusing a single Origin UI instance for automation to avoid the
+    // Controlled by UI: reuse a single Origin UI instance for automation to avoid the
     // expensive Origin COM shutdown path (EndSession/Exit/Release) on every job.
-    // Users can opt out by setting ORIGINBRIDGE_UI_AUTOMATION=0/false in the app env.
-    if std::env::var_os("ORIGINBRIDGE_UI_AUTOMATION").is_none() {
-        cmd.env("ORIGINBRIDGE_UI_AUTOMATION", "1");
-    }
+    cmd.env(
+        "ORIGINBRIDGE_UI_AUTOMATION",
+        if reuse_origin_ui { "1" } else { "0" },
+    );
+    cmd.env(
+        "ORIGINBRIDGE_MULTI_INSTANCE_UI",
+        if reuse_origin_ui { "0" } else { "1" },
+    );
 
     let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
     final_args.extend(args);
@@ -549,6 +554,37 @@ function Release-ComObject($obj) {
   }
 }
 
+function Wait-ProcessesExit([object[]]$pids, [int]$timeoutMs = 30000) {
+  if ($null -eq $pids) { return $true }
+
+  $unique = @()
+  foreach ($pid in $pids) {
+    try {
+      $v = 0
+      if ([int]::TryParse([string]$pid, [ref]$v)) {
+        if ($v -gt 0) { $unique += $v }
+      }
+    } catch {}
+  }
+  try { $unique = @($unique | Select-Object -Unique) } catch {}
+  if (-not $unique -or $unique.Count -eq 0) { return $true }
+
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+    $alive = @()
+    foreach ($pid in $unique) {
+      try {
+        $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        if ($p) { $alive += $pid }
+      } catch {}
+    }
+    if (-not $alive -or $alive.Count -eq 0) { return $true }
+    Start-Sleep -Milliseconds 200
+  }
+
+  return $false
+}
+
 function Wait-FileUnlocked([string]$path, [int]$timeoutMs = 10000) {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
@@ -572,6 +608,12 @@ function Test-EnvTruthy([string]$value) {
   $v = $value.Trim().ToLowerInvariant()
   return @('1','true','yes','y','on') -contains $v
 }
+
+$MAINWND_HIDE = 0
+$MAINWND_SHOW = 1
+$MAINWND_SHOWMINIMIZED = 2
+$MAINWND_SHOWMAXIMIZED = 3
+$MAINWND_SHOW_BRING_TO_FRONT = 100
 
 function Start-OriginBridgeCleanup([string]$workDir, [string]$projectPath, [string]$traceDir) {
   if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_ENABLE_CLEANUP)) {
@@ -1099,10 +1141,15 @@ try {
       throw $msg
     }
 
+    $forceNewInstance = Test-EnvTruthy $env:ORIGINBRIDGE_MULTI_INSTANCE_UI
+
     # Default: prefer a dedicated automation instance so we don't attach to (and accidentally
     # close) an already running Origin UI instance unless explicitly requested.
     $progIds = @('Origin.Application', 'Origin.ApplicationSI')
-    if ((-not $preferUi) -and (Test-OriginUiRunning $originExePath)) {
+    if ($forceNewInstance) {
+      # Multi-instance UI mode: always create a brand new Origin process (do NOT attach to an existing UI instance).
+      $progIds = @('Origin.Application')
+    } elseif ((-not $preferUi) -and (Test-OriginUiRunning $originExePath)) {
       # If UI is already running, prefer attaching to it so we create a new workbook/graph
       # window inside the existing instance (avoids hitting instance limits and preserves
       # the user's current Origin session).
@@ -1111,8 +1158,22 @@ try {
     foreach ($progId in $progIds) {
       try {
         Write-Host "Trying Origin COM ProgID: $progId"
+        $originProcName2 = ''
+        try { $originProcName2 = [IO.Path]::GetFileNameWithoutExtension($originExePath) } catch { $originProcName2 = '' }
+        $before = @()
+        try { if ($originProcName2) { $before = @(Get-Process -Name $originProcName2 -ErrorAction SilentlyContinue) } } catch { $before = @() }
+        $beforeIds = @()
+        try { $beforeIds = @($before | ForEach-Object { $_.Id }) } catch { $beforeIds = @() }
+
         $obj = New-Object -ComObject $progId
-        return @{ ProgId = $progId; Object = $obj; LaunchedUi = $false }
+
+        $after = @()
+        try { if ($originProcName2) { $after = @(Get-Process -Name $originProcName2 -ErrorAction SilentlyContinue) } } catch { $after = @() }
+        $newProcs = @()
+        try { $newProcs = @($after | Where-Object { $beforeIds -notcontains $_.Id }) } catch { $newProcs = @() }
+        $newPids = @()
+        try { $newPids = @($newProcs | ForEach-Object { $_.Id }) } catch { $newPids = @() }
+        return @{ ProgId = $progId; Object = $obj; LaunchedUi = $false; SpawnedPids = $newPids }
       } catch {
         $lastError = $_
         Write-Host "COM failed: $progId :: $($_.Exception.Message)"
@@ -1153,16 +1214,22 @@ try {
       }
     }
   } catch {
-    Write-OriginBridgeLog "Origin process state check: $($_.Exception.Message)"
+    $msg = $_.Exception.Message
+    Write-OriginBridgeLog "Origin process state check: $msg"
+    if ($msg -like 'Detected multiple Origin processes*') { throw }
   }
 
   $origin = $null
   $originProgId = ''
   $attachedToUiInstance = $false
   $uiLaunched = $false
+  $originSpawnedPids = @()
   $preferUiAutomation = Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION
+  $multiInstanceUi = Test-EnvTruthy $env:ORIGINBRIDGE_MULTI_INSTANCE_UI
   if ($preferUiAutomation) {
     Write-OriginBridgeLog "UI automation mode: ON (use Origin UI instance; keep Origin running; no Exit()/relaunch). Set ORIGINBRIDGE_UI_AUTOMATION=0 to disable."
+  } elseif ($multiInstanceUi) {
+    Write-OriginBridgeLog "Multi-instance UI mode: ON (each ZIP launches a new Origin instance; keep Origin running; no Exit()/relaunch)."
   } else {
     Write-OriginBridgeLog "UI automation mode: OFF (use standalone COM instance; will Save() + Exit() + relaunch Origin UI). Set ORIGINBRIDGE_UI_AUTOMATION=1 to enable."
   }
@@ -1170,12 +1237,14 @@ try {
   # Serialize Origin automation across jobs: selecting multiple ZIPs starts multiple workers.
   # Without a lock, concurrent COM commands can race and break (e.g. plotxy fails).
   $originLock = $null
-  try {
-    $originLock = Acquire-OriginAutomationLock 600000
-    Write-OriginBridgeLog "Origin automation lock acquired."
-  } catch {
-    Write-OriginBridgeLog "Failed to acquire Origin automation lock. $($_.Exception.Message)"
-    throw
+  if ($preferUiAutomation -or $multiInstanceUi) {
+    try {
+      $originLock = Acquire-OriginAutomationLock 600000
+      Write-OriginBridgeLog "Origin automation lock acquired."
+    } catch {
+      Write-OriginBridgeLog "Failed to acquire Origin automation lock. $($_.Exception.Message)"
+      throw
+    }
   }
 
   try {
@@ -1185,10 +1254,14 @@ try {
     $originProgId = $originInfo.ProgId
     $origin = $originInfo.Object
     try { $uiLaunched = [bool]$originInfo.LaunchedUi } catch { $uiLaunched = $false }
+    try { $originSpawnedPids = @($originInfo.SpawnedPids) } catch { $originSpawnedPids = @() }
     $attachedToUiInstance = ($originProgId -eq 'Origin.ApplicationSI')
     Write-OriginBridgeLog "Origin COM created in $($comSw.ElapsedMilliseconds) ms. ProgID: $originProgId"
     if ($attachedToUiInstance) {
       Write-OriginBridgeLog "Origin COM is ApplicationSI (single instance); will NOT call Exit()."
+    }
+    if ($originSpawnedPids -and $originSpawnedPids.Count -gt 0) {
+      Write-OriginBridgeLog "Origin process id(s) spawned by COM: $($originSpawnedPids -join ',')"
     }
   } catch {
     $comErr = $_.Exception.Message
@@ -1227,12 +1300,13 @@ try {
   }
 
   # NOTE:
-  # - UI automation mode: show the COM instance UI and keep Origin running (no Exit()/relaunch).
-  # - Non-UI mode: keep the automation instance hidden, Save() to .opju, Exit(), then relaunch UI to open the .opju.
-  if (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
-    try { $origin.Visible = $true } catch {}
+  # - UI automation mode: attach to Origin UI instance and keep Origin running (no Exit()/relaunch).
+  # - Multi-instance UI mode: create a new Origin instance per job and keep Origin running (no Exit()/relaunch).
+  # - Legacy non-UI mode: keep the automation instance hidden, Save() to .opju, Exit(), then relaunch UI to open the .opju.
+  if ($preferUiAutomation -or $multiInstanceUi) {
+    try { $origin.Visible = $MAINWND_SHOW } catch {}
   } elseif (-not $attachedToUiInstance) {
-    $origin.Visible = $false
+    try { $origin.Visible = $MAINWND_HIDE } catch {}
   }
   $beginSw = [System.Diagnostics.Stopwatch]::StartNew()
   $origin.BeginSession() | Out-Null
@@ -1357,7 +1431,7 @@ try {
   }
 
   if ($attachedToUiInstance) {
-    try { $origin.Visible = $true } catch {}
+    try { $origin.Visible = $MAINWND_SHOW_BRING_TO_FRONT } catch {}
     try { $origin.Execute('win -a;') | Out-Null } catch {}
     try {
       $ws = New-Object -ComObject 'WScript.Shell'
@@ -1415,13 +1489,13 @@ try {
     $searchAfterSave2 = ''
     try { $searchAfterSave2 = $origin.ProjectSearch('G', $null, $null) } catch {}
     $searchForCleanup = $searchAfterSave2
-    if ($searchAfterSave2 -notmatch 'GraphPage') {
+  if ($searchAfterSave2 -notmatch 'GraphPage') {
       throw "Origin saved project but no GraphPage found (after fallback)"
     }
   }
 
-  if (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION) {
-    try { $origin.Visible = $true } catch {}
+  if ($preferUiAutomation -or $multiInstanceUi) {
+    try { $origin.Visible = $MAINWND_SHOW_BRING_TO_FRONT } catch {}
     try { $origin.Execute('win -a;') | Out-Null } catch {}
     try {
       $ws = New-Object -ComObject 'WScript.Shell'
@@ -1451,6 +1525,20 @@ try {
   $releaseSw.Stop()
   Write-OriginBridgeLog "Release COM took $($releaseSw.ElapsedMilliseconds) ms"
   $origin = $null
+
+  if ($originSpawnedPids -and $originSpawnedPids.Count -gt 0) {
+    $procWaitMs = 60000
+    $procWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $procExited = Wait-ProcessesExit $originSpawnedPids $procWaitMs
+    $procWaitSw.Stop()
+    Write-OriginBridgeLog "Wait-ProcessesExit took $($procWaitSw.ElapsedMilliseconds) ms (timeout=$procWaitMs, ok=$procExited, pids=$($originSpawnedPids -join ','))"
+    if (-not $procExited) {
+      Write-OriginBridgeLog "Origin process(es) still running after Exit()/Release; forcing termination."
+      foreach ($pid in $originSpawnedPids) {
+        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {}
+      }
+    }
+  }
 
   $unlockWaitMs = 60000
   try {

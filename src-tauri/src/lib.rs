@@ -1,0 +1,79 @@
+//! OriginBridge: local helper for plotting Appointer Origin packages (Windows).
+//!
+//! This app consumes a local `device_analysis_origin.zip` (downloaded from Appointer's
+//! "Export for Origin") and:
+//! - extracts the ZIP package to a local work directory
+//! - automates Origin via COM (OGS preferred, CSV fallback)
+//! - saves a `.opju` project and opens it in Origin UI
+
+mod utils;
+
+#[tauri::command]
+fn get_origin_exe_path() -> Result<Option<String>, String> {
+    utils::settings::get_origin_exe_path().map(|p| p.map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn set_origin_exe_path(path: String) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Origin executable path is empty".to_string());
+    }
+    let saved = utils::settings::set_origin_exe_path(std::path::Path::new(path))?;
+    Ok(saved.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn clear_origin_exe_path() -> Result<(), String> {
+    utils::settings::clear_origin_exe_path()
+}
+
+#[tauri::command]
+fn detect_origin_exe_candidates(deep_scan: Option<bool>) -> Result<serde_json::Value, String> {
+    utils::settings::detect_origin_exe_candidates(deep_scan.unwrap_or(false))
+}
+
+#[tauri::command]
+fn extract_zip_and_open_origin(zip_path: String) -> Result<serde_json::Value, String> {
+    let zip_path = zip_path.trim();
+    if zip_path.is_empty() {
+        return Err("ZIP path is empty".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let origin_exe = utils::settings::get_origin_exe_path()?
+            .ok_or_else(|| "Origin 可执行文件未配置：请先在页面上选择并保存路径。".to_string())?;
+
+        let result = utils::origin::extract_zip_and_launch_origin(
+            std::path::Path::new(zip_path),
+            &origin_exe,
+        )
+        .map_err(|e| format!("Failed to extract and open: {e}"))?;
+        return Ok(result);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = zip_path;
+        Err("This feature is only supported on Windows".to_string())
+    }
+}
+
+/// Application entry point.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // Normal app launch: show a small "ready" window.
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            get_origin_exe_path,
+            set_origin_exe_path,
+            clear_origin_exe_path,
+            detect_origin_exe_candidates,
+            extract_zip_and_open_origin
+        ])
+        .setup(|_app| Ok(()))
+        .run(tauri::generate_context!())
+        .expect("error while running OriginBridge");
+}

@@ -1,0 +1,22 @@
+{
+  "name": "originbridge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "tauri": "tauri",
+    "build": "vite build",
+    "tauri:dev": "npm run tauri dev",
+    "tauri:build": "npm run tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.6",
+    "vite": "^7.3.0"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-dialog": "^2.5.0"
+  }
+}

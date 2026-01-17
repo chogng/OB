@@ -1,0 +1,2 @@
+你运行在windows终端的powsershell中，因此不要运行linux命令
+

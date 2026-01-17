@@ -34,7 +34,10 @@ fn detect_origin_exe_candidates(deep_scan: Option<bool>) -> Result<serde_json::V
 }
 
 #[tauri::command]
-fn extract_zip_and_open_origin(zip_path: String) -> Result<serde_json::Value, String> {
+fn extract_zip_and_open_origin(
+    zip_path: String,
+    save_path: Option<String>,
+) -> Result<serde_json::Value, String> {
     let zip_path = zip_path.trim();
     if zip_path.is_empty() {
         return Err("ZIP path is empty".to_string());
@@ -64,6 +67,7 @@ fn extract_zip_and_open_origin(zip_path: String) -> Result<serde_json::Value, St
         let result = utils::origin::extract_zip_and_launch_origin(
             std::path::Path::new(zip_path),
             &origin_exe,
+            save_path,
         )
         .map_err(|e| format!("Failed to extract and open: {e}"))?;
         return Ok(result);

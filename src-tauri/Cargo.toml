@@ -23,6 +23,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde_json = "1"
 zip = "2"
+chrono = "0.4.43"
 
 # Optimize for smaller binary size in release builds
 [profile.release]

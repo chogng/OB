@@ -140,10 +140,19 @@
       <select id="originCandidates" style="display: none; min-width: 420px"></select>
     </div>
 
+    <h2>保存设置</h2>
+    <div class="row" style="margin-top: 10px">
+      <span>保存路径：</span>
+      <input id="savePath" type="text" placeholder="例如：C:\Users\lanxi\Documents\OriginBridge"
+        value="C:\Users\lanxi\Documents\OriginBridge" style="flex: 1; max-width: 500px;" />
+    </div>
+
+
+
     <h2>ZIP 处理</h2>
 
     <div class="row" style="margin-top: 10px">
-      <button id="pickZipBtn">选择 ZIP（可多选）</button>
+      <button id="pickZipBtn">选择 ZIP</button>
       <button id="extractZipBtn">打开origin</button>
       <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
     </div>
@@ -166,7 +175,9 @@
 
     const pickZipBtn = document.getElementById('pickZipBtn')
     const extractZipBtn = document.getElementById('extractZipBtn')
+
     const pickedZipPathEl = document.getElementById('pickedZipPath')
+    const savePathEl = document.getElementById('savePath')
 
     let pickedZipPaths = []
     let isBusy = false
@@ -388,7 +399,8 @@
           setStatus(`(${i + 1}/${zips.length}) 正在启动出图任务…\nZIP: ${zipPath}`)
 
           try {
-            const result = await invoke('extract_zip_and_open_origin', { zipPath })
+            const savePath = (savePathEl.value || '').trim()
+            const result = await invoke('extract_zip_and_open_origin', { zipPath, savePath })
             const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
             const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
             const errHint = result?.errorPath ? `\n错误文件: ${result.errorPath}` : ''

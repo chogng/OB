@@ -86,6 +86,7 @@ fn powershell_exe_path() -> PathBuf {
 pub fn extract_zip_and_launch_origin(
     zip_path: &std::path::Path,
     origin_exe: &std::path::Path,
+    save_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use std::fs;
 
@@ -117,23 +118,38 @@ pub fn extract_zip_and_launch_origin(
         .canonicalize()
         .unwrap_or_else(|_| raw_zip.to_path_buf());
 
-    let work_root = match work_root_dir_for_zip(&zip_full) {
-        Ok(p) => p,
-        Err(_) => {
-            let fallback = std::env::temp_dir().join("OriginBridge");
-            ensure_dir(&fallback)?;
-            fallback
+    let work_root = if let Some(sp) = save_path.as_ref().filter(|s| !s.trim().is_empty()) {
+        let p = std::path::PathBuf::from(sp.trim());
+        ensure_dir(&p)?;
+        p
+    } else {
+        match work_root_dir_for_zip(&zip_full) {
+            Ok(p) => p,
+            Err(_) => {
+                let fallback = std::env::temp_dir().join("OriginBridge");
+                ensure_dir(&fallback)?;
+                fallback
+            }
         }
     };
 
-    // Create extract directory: work_root/Extract/{zip_name}
+    // Create extract directory:
+    // If save_path is provided: [Save Path]\[Date]\[Zip Filename]
+    // Otherwise: work_root/Extract/{zip_name}
     let name_hint = zip_full
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("origin_package");
     let name_hint = sanitize_path_component(name_hint);
-    let base_extract_dir = work_root.join("Extract").join(name_hint.clone());
+
+    let base_extract_dir = if save_path.is_some() {
+        let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        work_root.join(date_str).join(name_hint.clone())
+    } else {
+        work_root.join("Extract").join(name_hint.clone())
+    };
+
     let mut extract_dir = base_extract_dir.clone();
 
     // Overwrite any previous extracted folder for this ZIP name.
@@ -146,7 +162,12 @@ pub fn extract_zip_and_launch_origin(
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+                if save_path.is_some() {
+                     let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+                     extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
+                } else {
+                     extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+                }
             }
 
         } else {
@@ -171,7 +192,12 @@ pub fn extract_zip_and_launch_origin(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+             if save_path.is_some() {
+                 let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+                 extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
+            } else {
+                 extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+            }
         }
     }
 
@@ -321,7 +347,14 @@ pub fn extract_zip_and_launch_origin(
 
     // Best-effort: if the worker fails immediately, surface the error to the UI instead of
     // returning "started" while nothing actually runs.
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let fast_start = std::env::var("ORIGINBRIDGE_FAST_START")
+        .ok()
+        .map(|v| !v.trim().is_empty() && ["1", "true", "yes", "y", "on"].contains(&v.trim().to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    let wait_ms = if fast_start { 0 } else { 1200 };
+    if wait_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+    }
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
             let worker_err = fs::read_to_string(&worker_error_path).unwrap_or_default();
@@ -358,11 +391,17 @@ pub fn extract_zip_and_launch_origin(
 
 fn find_ogs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if out.len() >= 200 {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
 
         for entry in entries.flatten() {
+            if out.len() >= 200 {
+                return;
+            }
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out);
@@ -380,14 +419,6 @@ fn find_ogs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
     let mut ogs_files = Vec::new();
     walk(dir, &mut ogs_files);
-
-    // Sort by last write time (most recent first)
-    ogs_files.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(UNIX_EPOCH)
-    });
-    ogs_files.reverse();
 
     ogs_files
 }
@@ -779,44 +810,76 @@ try {
     }
   }
 
-  $ogs = Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.ogs |
-    Where-Object { $_.Name -notmatch '^originbridge_job\\.ogs$' } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+  function Enumerate-FilesSafe([string]$root, [string]$pattern) {
+    if (-not $root) { return @() }
+    if (-not (Test-Path -LiteralPath $root)) { return @() }
+    try {
+      return [System.IO.Directory]::EnumerateFiles($root, $pattern, [System.IO.SearchOption]::AllDirectories)
+    } catch {
+      try {
+        $p = $pattern
+        if ($p.StartsWith('*.')) { $p = $p.Substring(2) }
+        $items = Get-ChildItem -Path $root -Recurse -File -Filter $p -ErrorAction SilentlyContinue
+        return @($items | ForEach-Object { $_.FullName })
+      } catch {
+        return @()
+      }
+    }
+  }
 
-  $csvCandidates = @(
-    Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.csv |
-      Where-Object { $_.Name -notmatch 'metrics' -and $_.Name -notmatch '^originbridge_job\\.csv$' }
-  )
+  $scanSw = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-OriginBridgeLog "Scanning package files under: $pkgDir"
 
-  if ($csvCandidates.Count -eq 0) {
-    $csvCandidates = @(
-      Get-ChildItem -Path $pkgDir -Recurse -File -Filter *.csv |
-        Where-Object { $_.Name -notmatch '^originbridge_job\\.csv$' }
-    )
+  $ogs = $null
+  foreach ($p in (Enumerate-FilesSafe $pkgDir '*.ogs')) {
+    try {
+      $fi = [System.IO.FileInfo]$p
+      if ($fi.Name -match '^originbridge_job\.ogs$') { continue }
+      if ($null -eq $ogs -or $fi.LastWriteTimeUtc -gt $ogs.LastWriteTimeUtc) { $ogs = $fi }
+    } catch {}
+  }
+
+  $ogsBase = ''
+  if ($ogs) {
+    try { $ogsBase = [IO.Path]::GetFileNameWithoutExtension($ogs.Name) } catch { $ogsBase = '' }
+  }
+
+  $csvBestMatchOgsBase = $null
+  $csvBestNonMetrics = $null
+  $csvBestAny = $null
+  foreach ($p in (Enumerate-FilesSafe $pkgDir '*.csv')) {
+    try {
+      $fi = [System.IO.FileInfo]$p
+      if ($fi.Name -match '^originbridge_job\.csv$') { continue }
+
+      $isMetrics = ($fi.Name -match 'metrics')
+      if ($null -eq $csvBestAny -or $fi.LastWriteTimeUtc -gt $csvBestAny.LastWriteTimeUtc) { $csvBestAny = $fi }
+      if (-not $isMetrics) {
+        if ($null -eq $csvBestNonMetrics -or $fi.LastWriteTimeUtc -gt $csvBestNonMetrics.LastWriteTimeUtc) { $csvBestNonMetrics = $fi }
+      }
+
+      if ($ogsBase -and (-not $isMetrics)) {
+        $b = ''
+        try { $b = [IO.Path]::GetFileNameWithoutExtension($fi.Name) } catch { $b = '' }
+        if ($b -eq $ogsBase) {
+          if ($null -eq $csvBestMatchOgsBase -or $fi.LastWriteTimeUtc -gt $csvBestMatchOgsBase.LastWriteTimeUtc) { $csvBestMatchOgsBase = $fi }
+        }
+      }
+    } catch {}
   }
 
   $csv = $null
-  if ($ogs -and $csvCandidates.Count -gt 0) {
-    $ogsBase = [IO.Path]::GetFileNameWithoutExtension($ogs.Name)
-    if ($ogsBase) {
-      $csv = $csvCandidates |
-        Where-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $ogsBase } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    }
-  }
-
-  if (-not $csv -and $csvCandidates.Count -gt 0) {
-    if ($csvCandidates.Count -eq 1) {
-      $csv = $csvCandidates[0]
-    } else {
-      $csv = $csvCandidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    }
-  }
+  if ($csvBestMatchOgsBase) { $csv = $csvBestMatchOgsBase }
+  elseif ($csvBestNonMetrics) { $csv = $csvBestNonMetrics }
+  else { $csv = $csvBestAny }
 
   $csvPath = ''
   if ($csv) { $csvPath = $csv.FullName }
+
+  $scanSw.Stop()
+  $ogsHint = ''
+  if ($ogs) { $ogsHint = $ogs.FullName }
+  Write-OriginBridgeLog "Scan done in $($scanSw.ElapsedMilliseconds) ms. Latest OGS: $ogsHint"
 
   function Get-OriginExePath([string]$preferred) {
     $p = $preferred

@@ -42,8 +42,24 @@ fn extract_zip_and_open_origin(zip_path: String) -> Result<serde_json::Value, St
 
     #[cfg(target_os = "windows")]
     {
-        let origin_exe = utils::settings::get_origin_exe_path()?
-            .ok_or_else(|| "Origin 可执行文件未配置：请先在页面上选择并保存路径。".to_string())?;
+        let mut origin_exe = utils::settings::get_origin_exe_path()?;
+
+        if origin_exe.is_none() {
+            // Auto-detect if not configured
+            let candidates = utils::settings::detect_origin_exe_candidates(false)
+                .map_err(|e| format!("Auto-detection failed: {e}"))?;
+            
+            if let Some(arr) = candidates.as_array() {
+                if let Some(first) = arr.first() {
+                    if let Some(path_str) = first.get("path").and_then(|v| v.as_str()) {
+                        origin_exe = Some(std::path::PathBuf::from(path_str));
+                    }
+                }
+            }
+        }
+
+        let origin_exe = origin_exe
+            .ok_or_else(|| "Origin 可执行文件未配置，且自动检测未找到 Origin，请手动配置。".to_string())?;
 
         let result = utils::origin::extract_zip_and_launch_origin(
             std::path::Path::new(zip_path),

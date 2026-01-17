@@ -1,378 +1,391 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>OriginBridge</title>
-    <style>
-      :root {
-        color-scheme: light dark;
-      }
-      body {
-        font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, -apple-system, 'Segoe UI',
-          Roboto, Arial, sans-serif;
-        margin: 24px;
-        line-height: 1.4;
-      }
-      code {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
-          'Courier New', monospace;
-      }
-      .card {
-        max-width: 860px;
-        border: 1px solid rgba(127, 127, 127, 0.25);
-        border-radius: 12px;
-        padding: 18px 18px;
-      }
-      h1 {
-        margin: 0 0 8px 0;
-        font-size: 18px;
-      }
-      h2 {
-        margin: 18px 0 8px 0;
-        font-size: 14px;
-      }
-      p {
-        margin: 8px 0;
-      }
-      .muted {
-        opacity: 0.8;
-      }
-      .row {
-        display: flex;
-        gap: 10px;
-        align-items: center;
-        flex-wrap: wrap;
-      }
-      .row > * {
-        flex: 0 0 auto;
-      }
-      input[type='text'] {
-        width: min(720px, 100%);
-        padding: 10px 12px;
-        border-radius: 10px;
-        border: 1px solid rgba(127, 127, 127, 0.35);
-        background: transparent;
-        color: inherit;
-        outline: none;
-      }
-      button {
-        font-family: inherit;
-        padding: 10px 12px;
-        border-radius: 10px;
-        border: 1px solid rgba(127, 127, 127, 0.35);
-        background: rgba(127, 127, 127, 0.12);
-        color: inherit;
-        cursor: pointer;
-      }
-      input,
-      select {
-        font-family: inherit;
-      }
-      button:hover {
-        background: rgba(127, 127, 127, 0.18);
-      }
-      button:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-      .status {
-        margin-top: 10px;
-        padding: 10px 12px;
-        border-radius: 10px;
-        border: 1px solid rgba(127, 127, 127, 0.25);
-        background: rgba(127, 127, 127, 0.08);
-        font-size: 12px;
-        white-space: pre-wrap;
-      }
-      .status.error {
-        border-color: rgba(220, 38, 38, 0.35);
-        background: rgba(220, 38, 38, 0.08);
-      }
-      details {
-        margin-top: 18px;
-      }
-    </style>
-  </head>
 
-  <body>
-    <div class="card">
-      <h1>OriginBridge</h1>
-      <p class="muted">
-        本工具用于处理本地 <code>device_analysis_origin.zip</code>（Appointer Device Analysis 页面导出），并自动拉起
-        Origin 出图（Windows）。
-      </p>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OriginBridge</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+    }
 
-      <div id="status" class="status">Loading...</div>
+    body {
+      font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, -apple-system, 'Segoe UI',
+        Roboto, Arial, sans-serif;
+      margin: 24px;
+      line-height: 1.4;
+    }
 
-      <h2>Origin 可执行文件路径</h2>
-      <p class="muted">需要先配置本机 Origin 的可执行文件路径，才能自动拉起 Origin 打开出图结果。</p>
-      <div class="row" style="margin-top: 10px">
-        <input id="originExe" type="text" placeholder="例如：C:\\Program Files\\OriginLab\\Origin2024\\Origin64.exe" />
-        <button id="pickOriginExeBtn">选择 Origin 可执行文件</button>
-        <button id="detectOriginExeBtn">自动检测</button>
-        <button id="detectOriginExeDeepBtn" title="会递归扫描常见安装目录，可能较慢">深度扫描（慢）</button>
-        <button id="saveOriginExeBtn">保存</button>
-      </div>
-      <div class="row" style="margin-top: 10px">
-        <select id="originCandidates" style="display: none; min-width: 420px"></select>
-      </div>
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+        'Courier New', monospace;
+    }
 
-      <h2>ZIP 处理</h2>
-      <p class="muted">
-        解压 ZIP 到 ZIP 所在目录下的 <code>extracted_（ZIP文件名）</code> 目录（例如 <code>extracted_device_analysis_origin</code>；重复运行会覆盖），然后自动拉起 Origin 导入 .ogs 文件。
-      </p>
-      <div class="row" style="margin-top: 10px">
-        <button id="pickZipBtn">选择 ZIP</button>
-        <button id="extractZipBtn">打开origin</button>
-        <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
-      </div>
+    .card {
+      max-width: 860px;
+      border: 1px solid rgba(127, 127, 127, 0.25);
+      border-radius: 12px;
+      padding: 18px 18px;
+    }
+
+    h1 {
+      margin: 0 0 8px 0;
+      font-size: 18px;
+    }
+
+    h2 {
+      margin: 18px 0 8px 0;
+      font-size: 14px;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    .muted {
+      opacity: 0.8;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .row>* {
+      flex: 0 0 auto;
+    }
+
+    input[type='text'] {
+      width: min(720px, 100%);
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, 0.35);
+      background: transparent;
+      color: inherit;
+      outline: none;
+    }
+
+    button {
+      font-family: inherit;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, 0.35);
+      background: rgba(127, 127, 127, 0.12);
+      color: inherit;
+      cursor: pointer;
+    }
+
+    input,
+    select {
+      font-family: inherit;
+    }
+
+    button:hover {
+      background: rgba(127, 127, 127, 0.18);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, 0.25);
+      background: rgba(127, 127, 127, 0.08);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    .status.error {
+      border-color: rgba(220, 38, 38, 0.35);
+      background: rgba(220, 38, 38, 0.08);
+    }
+
+    details {
+      margin-top: 18px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+
+
+    <div id="status" class="status">Loading...</div>
+
+    <h2>Origin路径选择</h2>
+
+    <div class="row" style="margin-top: 10px">
+      <input id="originExe" type="text" placeholder="例如：C:\\Program Files\\OriginLab\\Origin2024\\Origin64.exe" />
+      <button id="pickOriginExeBtn">选择 origin.exe</button>
+      <button id="detectOriginExeBtn">自动检测</button>
+      <button id="detectOriginExeDeepBtn" title="会递归扫描常见安装目录，可能较慢">深度扫描（慢）</button>
+      <button id="saveOriginExeBtn">保存</button>
+    </div>
+    <div class="row" style="margin-top: 10px">
+      <select id="originCandidates" style="display: none; min-width: 420px"></select>
     </div>
 
-    <script type="module">
-      import { invoke } from '@tauri-apps/api/core'
-      import { open } from '@tauri-apps/plugin-dialog'
+    <h2>ZIP 处理</h2>
 
-      const statusEl = document.getElementById('status')
+    <div class="row" style="margin-top: 10px">
+      <button id="pickZipBtn">选择 ZIP</button>
+      <button id="extractZipBtn">打开origin</button>
+      <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
+    </div>
+  </div>
 
-      const originExeEl = document.getElementById('originExe')
-      const pickOriginExeBtn = document.getElementById('pickOriginExeBtn')
-      const detectOriginExeBtn = document.getElementById('detectOriginExeBtn')
-      const detectOriginExeDeepBtn = document.getElementById('detectOriginExeDeepBtn')
-      const saveOriginExeBtn = document.getElementById('saveOriginExeBtn')
-      const originCandidatesEl = document.getElementById('originCandidates')
+  <script type="module">
+    import { invoke } from '@tauri-apps/api/core'
+    import { open } from '@tauri-apps/plugin-dialog'
 
-      const pickZipBtn = document.getElementById('pickZipBtn')
-      const extractZipBtn = document.getElementById('extractZipBtn')
-      const pickedZipPathEl = document.getElementById('pickedZipPath')
+    const statusEl = document.getElementById('status')
 
-      let pickedZipPath = ''
-      let isBusy = false
+    const originExeEl = document.getElementById('originExe')
+    const pickOriginExeBtn = document.getElementById('pickOriginExeBtn')
+    const detectOriginExeBtn = document.getElementById('detectOriginExeBtn')
+    const detectOriginExeDeepBtn = document.getElementById('detectOriginExeDeepBtn')
+    const saveOriginExeBtn = document.getElementById('saveOriginExeBtn')
+    const originCandidatesEl = document.getElementById('originCandidates')
 
-      function setBusy(v) {
-        isBusy = Boolean(v)
-        for (const el of [
-          pickOriginExeBtn,
-          detectOriginExeBtn,
-          detectOriginExeDeepBtn,
-          saveOriginExeBtn,
-          pickZipBtn,
-          extractZipBtn,
-        ])
-          el.disabled = isBusy
+    const pickZipBtn = document.getElementById('pickZipBtn')
+    const extractZipBtn = document.getElementById('extractZipBtn')
+    const pickedZipPathEl = document.getElementById('pickedZipPath')
 
-        if (!isBusy) extractZipBtn.disabled = !pickedZipPath
+    let pickedZipPath = ''
+    let isBusy = false
+
+    function setBusy(v) {
+      isBusy = Boolean(v)
+      for (const el of [
+        pickOriginExeBtn,
+        detectOriginExeBtn,
+        detectOriginExeDeepBtn,
+        saveOriginExeBtn,
+        pickZipBtn,
+        extractZipBtn,
+      ])
+        el.disabled = isBusy
+
+      if (!isBusy) extractZipBtn.disabled = !pickedZipPath
+    }
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg
+      statusEl.classList.toggle('error', Boolean(isError))
+    }
+
+    function setPickedZipPath(p) {
+      pickedZipPath = (p || '').trim()
+      pickedZipPathEl.textContent = pickedZipPath || '(未选择)'
+      if (!isBusy) extractZipBtn.disabled = !pickedZipPath
+    }
+
+    function getOriginExePath() {
+      return (originExeEl.value || '').trim()
+    }
+
+    function setOriginCandidates(candidates) {
+      const list = Array.isArray(candidates) ? candidates : []
+      originCandidatesEl.innerHTML = ''
+
+      if (list.length <= 1) {
+        originCandidatesEl.style.display = 'none'
+        return
       }
 
-      function setStatus(msg, isError = false) {
-        statusEl.textContent = msg
-        statusEl.classList.toggle('error', Boolean(isError))
+      for (const c of list) {
+        const opt = document.createElement('option')
+        const version = (c?.version || '').trim()
+        const name = (c?.productName || '').trim()
+        const labelParts = []
+        if (name) labelParts.push(name)
+        if (version) labelParts.push(version)
+        const labelPrefix = labelParts.length ? labelParts.join(' ') + ' — ' : ''
+        opt.value = c?.path || ''
+        opt.textContent = labelPrefix + (c?.path || '')
+        originCandidatesEl.appendChild(opt)
       }
 
-      function setPickedZipPath(p) {
-        pickedZipPath = (p || '').trim()
-        pickedZipPathEl.textContent = pickedZipPath || '(未选择)'
-        if (!isBusy) extractZipBtn.disabled = !pickedZipPath
-      }
+      originCandidatesEl.selectedIndex = 0
+      originCandidatesEl.style.display = ''
+    }
 
-      function getOriginExePath() {
-        return (originExeEl.value || '').trim()
+    async function refreshOriginExePath() {
+      if (!invoke) return
+      try {
+        const p = await invoke('get_origin_exe_path')
+        originExeEl.value = p || ''
+      } catch {
+        // ignore
       }
+    }
 
-      function setOriginCandidates(candidates) {
+    async function saveOriginExePath() {
+      if (!invoke) return
+      const p = getOriginExePath()
+      if (!p) {
+        setStatus('请先填写或选择 Origin 可执行文件路径。', true)
+        return
+      }
+      setBusy(true)
+      try {
+        const saved = await invoke('set_origin_exe_path', { path: p })
+        originExeEl.value = saved || p
+        setStatus('已保存 Origin 可执行文件：' + (saved || p))
+      } catch (e) {
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function pickOriginExe() {
+      if (!invoke) {
+        setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+        return
+      }
+      setBusy(true)
+      try {
+        const selected = await open({
+          directory: false,
+          multiple: false,
+          title: '选择 Origin 可执行文件（Origin64.exe/Origin.exe）',
+          filters: [{ name: 'EXE', extensions: ['exe'] }],
+        })
+
+        if (!selected) {
+          setStatus('未选择 Origin 可执行文件。')
+          return
+        }
+
+        originExeEl.value = selected
+        await saveOriginExePath()
+      } catch (e) {
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function detectOriginExe(opts = {}) {
+      if (!invoke) {
+        setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+        return
+      }
+      const deepScan = Boolean(opts?.deepScan)
+      setBusy(true)
+      try {
+        setStatus(deepScan ? '正在深度扫描 Origin 可执行文件…（可能较慢）' : '正在自动检测 Origin 可执行文件…')
+        const candidates = await invoke('detect_origin_exe_candidates', { deepScan })
         const list = Array.isArray(candidates) ? candidates : []
-        originCandidatesEl.innerHTML = ''
-
-        if (list.length <= 1) {
-          originCandidatesEl.style.display = 'none'
-          return
-        }
-
-        for (const c of list) {
-          const opt = document.createElement('option')
-          const version = (c?.version || '').trim()
-          const name = (c?.productName || '').trim()
-          const labelParts = []
-          if (name) labelParts.push(name)
-          if (version) labelParts.push(version)
-          const labelPrefix = labelParts.length ? labelParts.join(' ') + ' — ' : ''
-          opt.value = c?.path || ''
-          opt.textContent = labelPrefix + (c?.path || '')
-          originCandidatesEl.appendChild(opt)
-        }
-
-        originCandidatesEl.selectedIndex = 0
-        originCandidatesEl.style.display = ''
-      }
-
-      async function refreshOriginExePath() {
-        if (!invoke) return
-        try {
-          const p = await invoke('get_origin_exe_path')
-          originExeEl.value = p || ''
-        } catch {
-          // ignore
-        }
-      }
-
-      async function saveOriginExePath() {
-        if (!invoke) return
-        const p = getOriginExePath()
-        if (!p) {
-          setStatus('请先填写或选择 Origin 可执行文件路径。', true)
-          return
-        }
-        setBusy(true)
-        try {
-          const saved = await invoke('set_origin_exe_path', { path: p })
-          originExeEl.value = saved || p
-          setStatus('已保存 Origin 可执行文件：' + (saved || p))
-        } catch (e) {
-          setStatus(String(e?.message || e), true)
-        } finally {
-          setBusy(false)
-        }
-      }
-
-      async function pickOriginExe() {
-        if (!invoke) {
-          setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
-          return
-        }
-        setBusy(true)
-        try {
-          const selected = await open({
-            directory: false,
-            multiple: false,
-            title: '选择 Origin 可执行文件（Origin64.exe/Origin.exe）',
-            filters: [{ name: 'EXE', extensions: ['exe'] }],
-          })
-
-          if (!selected) {
-            setStatus('未选择 Origin 可执行文件。')
-            return
-          }
-
-          originExeEl.value = selected
-          await saveOriginExePath()
-        } catch (e) {
-          setStatus(String(e?.message || e), true)
-        } finally {
-          setBusy(false)
-        }
-      }
-
-      async function detectOriginExe(opts = {}) {
-        if (!invoke) {
-          setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
-          return
-        }
-        const deepScan = Boolean(opts?.deepScan)
-        setBusy(true)
-        try {
-          setStatus(deepScan ? '正在深度扫描 Origin 可执行文件…（可能较慢）' : '正在自动检测 Origin 可执行文件…')
-          const candidates = await invoke('detect_origin_exe_candidates', { deepScan })
-          const list = Array.isArray(candidates) ? candidates : []
-          if (!list.length) {
-            setOriginCandidates([])
-            setStatus(deepScan ? '深度扫描未检测到 Origin 可执行文件，请手动选择。' : '未检测到 Origin 可执行文件，可尝试“深度扫描”或手动选择。', true)
-            return
-          }
-
-          setOriginCandidates(list)
-          originExeEl.value = list[0]?.path || ''
-          if (list.length > 1) {
-            setStatus(`检测到多个 Origin 版本，已默认选择最新版本（共 ${list.length} 个）。可在下拉框切换后点击保存。`)
-          } else {
-            setStatus('已检测到 Origin 可执行文件，已自动填入。点击保存以确认。')
-          }
-        } catch (e) {
+        if (!list.length) {
           setOriginCandidates([])
-          setStatus(String(e?.message || e), true)
-        } finally {
-          setBusy(false)
-        }
-      }
-
-      async function pickZipForExtract() {
-        if (!invoke) {
-          setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+          setStatus(deepScan ? '深度扫描未检测到 Origin 可执行文件，请手动选择。' : '未检测到 Origin 可执行文件，可尝试“深度扫描”或手动选择。', true)
           return
         }
 
-        setBusy(true)
-        try {
-          const selected = await open({
-            directory: false,
-            multiple: false,
-            title: '选择要解压的 ZIP',
-            filters: [{ name: 'ZIP', extensions: ['zip'] }],
-          })
-
-          if (!selected) {
-            setStatus('未选择 ZIP。')
-            return
-          }
-
-          setPickedZipPath(selected)
-          setStatus(`已选择 ZIP：${selected}`)
-        } catch (e) {
-          setStatus(String(e?.message || e), true)
-        } finally {
-          setBusy(false)
+        setOriginCandidates(list)
+        originExeEl.value = list[0]?.path || ''
+        if (list.length > 1) {
+          setStatus(`检测到多个 Origin 版本，已默认选择最新版本（共 ${list.length} 个）。可在下拉框切换后点击保存。`)
+        } else {
+          setStatus('已检测到 Origin 可执行文件，已自动填入。点击保存以确认。')
         }
+      } catch (e) {
+        setOriginCandidates([])
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function pickZipForExtract() {
+      if (!invoke) {
+        setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+        return
       }
 
-      async function extractZip() {
-        if (!invoke) {
-          setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+      setBusy(true)
+      try {
+        const selected = await open({
+          directory: false,
+          multiple: false,
+          title: '选择要解压的 ZIP',
+          filters: [{ name: 'ZIP', extensions: ['zip'] }],
+        })
+
+        if (!selected) {
+          setStatus('未选择 ZIP。')
           return
         }
 
-        if (!getOriginExePath()) {
-          setStatus('请先配置并保存 Origin 可执行文件路径。', true)
-          return
-        }
+        setPickedZipPath(selected)
+        setStatus(`已选择 ZIP：${selected}`)
+      } catch (e) {
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
 
-        if (!pickedZipPath) {
-          await pickZipForExtract()
-          if (!pickedZipPath) return
-        }
-
-        setBusy(true)
-        try {
-          const result = await invoke('extract_zip_and_open_origin', { zipPath: pickedZipPath })
-          const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
-          const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
-          const errHint = result?.errorPath ? `\n错误文件: ${result.errorPath}` : ''
-          setStatus(
-            `已解压并启动出图任务。\nZIP: ${pickedZipPath}\n解压目录: ${result.extractDir}\nOGS: ${ogsCount ? `${ogsCount} 个` : '未找到'}${logHint}${errHint}\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。`
-          )
-          statusEl.textContent +=
-            '\n\n提示：成功后会自动清理工作/日志文件夹（在你关闭已打开的 .opju 之后）。如需保留排查日志，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
-        } catch (e) {
-          setStatus(String(e?.message || e), true)
-        } finally {
-          setBusy(false)
-        }
+    async function extractZip() {
+      if (!invoke) {
+        setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+        return
       }
 
-      pickZipBtn.addEventListener('click', pickZipForExtract)
-      extractZipBtn.addEventListener('click', extractZip)
-      pickOriginExeBtn.addEventListener('click', pickOriginExe)
-      detectOriginExeBtn.addEventListener('click', () => detectOriginExe())
-      detectOriginExeDeepBtn.addEventListener('click', () => detectOriginExe({ deepScan: true }))
-      saveOriginExeBtn.addEventListener('click', saveOriginExePath)
-      originCandidatesEl.addEventListener('change', () => {
-        const v = originCandidatesEl.value || ''
-        if (v) originExeEl.value = v
-      })
+      if (!getOriginExePath()) {
+        setStatus('请先配置并保存 Origin 可执行文件路径。', true)
+        return
+      }
 
-      setPickedZipPath('')
-      refreshOriginExePath().finally(() => {
-        if (!getOriginExePath()) setStatus('请先配置 Origin 可执行文件路径。', true)
-        else setStatus('就绪。')
-      })
-    </script>
-  </body>
+      if (!pickedZipPath) {
+        await pickZipForExtract()
+        if (!pickedZipPath) return
+      }
+
+      setBusy(true)
+      try {
+        const result = await invoke('extract_zip_and_open_origin', { zipPath: pickedZipPath })
+        const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
+        const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
+        const errHint = result?.errorPath ? `\n错误文件: ${result.errorPath}` : ''
+        setStatus(
+          `已解压并启动出图任务。\nZIP: ${pickedZipPath}\n解压目录: ${result.extractDir}\nOGS: ${ogsCount ? `${ogsCount} 个` : '未找到'}${logHint}${errHint}\n\n后台将自动执行 OGS 并保存 .opju，然后用 Origin 打开该项目。`
+        )
+        statusEl.textContent +=
+          '\n\n提示：成功后会自动清理工作/日志文件夹（在你关闭已打开的 .opju 之后）。如需保留排查日志，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
+      } catch (e) {
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    pickZipBtn.addEventListener('click', pickZipForExtract)
+    extractZipBtn.addEventListener('click', extractZip)
+    pickOriginExeBtn.addEventListener('click', pickOriginExe)
+    detectOriginExeBtn.addEventListener('click', () => detectOriginExe())
+    detectOriginExeDeepBtn.addEventListener('click', () => detectOriginExe({ deepScan: true }))
+    saveOriginExeBtn.addEventListener('click', saveOriginExePath)
+    originCandidatesEl.addEventListener('change', () => {
+      const v = originCandidatesEl.value || ''
+      if (v) originExeEl.value = v
+    })
+
+    setPickedZipPath('')
+    refreshOriginExePath().finally(() => {
+      if (!getOriginExePath()) setStatus('请先配置 Origin 可执行文件路径。', true)
+      else setStatus('就绪。')
+    })
+  </script>
+</body>
+
 </html>

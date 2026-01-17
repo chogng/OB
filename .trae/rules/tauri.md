@@ -1,1 +1,1 @@
-tauri是热更，通常无需重复编译
+禁止cargo打包tauri

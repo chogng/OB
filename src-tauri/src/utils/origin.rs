@@ -802,6 +802,29 @@ function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath, [bool]$c
   if (-not $plotOk) { throw "Origin plotxy failed" }
 }
 
+function Close-LeftoverStartupBook1AfterSaveIfAny([__ComObject]$origin, [string]$projectSearchText, [bool]$launchedUi = $false) {
+  if (-not $launchedUi) { return }
+
+  try {
+    $pages = $projectSearchText
+    if (-not $pages) {
+      try { $pages = $origin.ProjectSearch('G', $null, $null) } catch { $pages = '' }
+    }
+    if (-not $pages) { return }
+
+    # Close Book1 only if it exists AND has no columns (i.e. it's still the default empty startup book).
+    if ($pages -notmatch '(?m)WorksheetPage:\s*\[Book1\]') { return }
+    if ($pages -match '(?m)Column:\s*\[Book1\]') { return }
+
+    Write-OriginBridgeLog "Closing leftover blank startup workbook Book1"
+    $ok = $false
+    try { $ok = $origin.Execute('doc -d Book1;') } catch { $ok = $false }
+    Write-OriginBridgeLog "Closed leftover Book1 (ok=$ok)"
+  } catch {
+    # ignore
+  }
+}
+
 try {
   if (-not (Test-Path -LiteralPath $WorkDir)) {
     New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
@@ -1064,7 +1087,7 @@ try {
             continue
           }
 
-          return @{ ProgId = $progId; Object = $obj }
+          return @{ ProgId = $progId; Object = $obj; LaunchedUi = $launchedUi }
         } catch {
           $lastError = $_
           Start-Sleep -Milliseconds 300
@@ -1089,7 +1112,7 @@ try {
       try {
         Write-Host "Trying Origin COM ProgID: $progId"
         $obj = New-Object -ComObject $progId
-        return @{ ProgId = $progId; Object = $obj }
+        return @{ ProgId = $progId; Object = $obj; LaunchedUi = $false }
       } catch {
         $lastError = $_
         Write-Host "COM failed: $progId :: $($_.Exception.Message)"
@@ -1136,6 +1159,7 @@ try {
   $origin = $null
   $originProgId = ''
   $attachedToUiInstance = $false
+  $uiLaunched = $false
   $preferUiAutomation = Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION
   if ($preferUiAutomation) {
     Write-OriginBridgeLog "UI automation mode: ON (use Origin UI instance; keep Origin running; no Exit()/relaunch). Set ORIGINBRIDGE_UI_AUTOMATION=0 to disable."
@@ -1160,6 +1184,7 @@ try {
     $comSw.Stop()
     $originProgId = $originInfo.ProgId
     $origin = $originInfo.Object
+    try { $uiLaunched = [bool]$originInfo.LaunchedUi } catch { $uiLaunched = $false }
     $attachedToUiInstance = ($originProgId -eq 'Origin.ApplicationSI')
     Write-OriginBridgeLog "Origin COM created in $($comSw.ElapsedMilliseconds) ms. ProgID: $originProgId"
     if ($attachedToUiInstance) {
@@ -1224,6 +1249,12 @@ try {
   if (-not $attachedToUiInstance) {
     # Fresh standalone automation instance; keep the project clean (avoid extra empty books).
     $fallbackNewBook = $false
+  } elseif ($uiLaunched) {
+    # First job: OriginBridge just launched Origin UI (which creates a default empty Book1).
+    # Reuse that startup Book1 for the first import so multi-select (N ZIPs) creates N books (not N+1).
+    $fallbackNewBook = $false
+    try { $origin.Execute('win -a Book1;') | Out-Null } catch {}
+    Write-OriginBridgeLog "First run after Origin UI launch; using startup Book1 for import (newbook=False)."
   }
 
   $ranOgs = $false
@@ -1365,6 +1396,7 @@ try {
   try { $searchAfterSave = $origin.ProjectSearch('G', $null, $null) } catch {}
   $searchSw.Stop()
   Write-OriginBridgeLog "Origin ProjectSearch('G') took $($searchSw.ElapsedMilliseconds) ms"
+  $searchForCleanup = $searchAfterSave
   if ($searchAfterSave -notmatch 'GraphPage') {
     Write-OriginBridgeLog "No GraphPage found after Save(); attempting fallback CSV plot."
     if (-not $attachedToUiInstance) {
@@ -1382,6 +1414,7 @@ try {
 
     $searchAfterSave2 = ''
     try { $searchAfterSave2 = $origin.ProjectSearch('G', $null, $null) } catch {}
+    $searchForCleanup = $searchAfterSave2
     if ($searchAfterSave2 -notmatch 'GraphPage') {
       throw "Origin saved project but no GraphPage found (after fallback)"
     }
@@ -1394,6 +1427,7 @@ try {
       $ws = New-Object -ComObject 'WScript.Shell'
       $null = $ws.AppActivate('Origin')
     } catch {}
+    Close-LeftoverStartupBook1AfterSaveIfAny $origin $searchForCleanup $uiLaunched
     try { $origin.EndSession() | Out-Null } catch {}
     Start-OriginBridgeCleanup $WorkDir $projPath ''
     try { Release-ComObject $origin } catch {}

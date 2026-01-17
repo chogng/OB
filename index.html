@@ -145,6 +145,7 @@
       <span>保存路径：</span>
       <input id="savePath" type="text" placeholder="例如：C:\Users\lanxi\Documents\OriginBridge"
         value="C:\Users\lanxi\Documents\OriginBridge" style="flex: 1; max-width: 500px;" />
+      <button id="pickSavePathBtn">选择路径</button>
     </div>
 
 
@@ -178,6 +179,7 @@
 
     const pickedZipPathEl = document.getElementById('pickedZipPath')
     const savePathEl = document.getElementById('savePath')
+    const pickSavePathBtn = document.getElementById('pickSavePathBtn')
 
     let pickedZipPaths = []
     let isBusy = false
@@ -205,6 +207,7 @@
         detectOriginExeBtn,
         detectOriginExeDeepBtn,
         saveOriginExeBtn,
+        pickSavePathBtn,
         pickZipBtn,
         extractZipBtn,
       ])
@@ -373,6 +376,30 @@
       }
     }
 
+    async function pickSavePath() {
+      if (!invoke) {
+        setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
+        return
+      }
+      setBusy(true)
+      try {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: '选择保存路径',
+          defaultPath: savePathEl.value || undefined,
+        })
+
+        if (!selected) return
+
+        savePathEl.value = selected
+      } catch (e) {
+        setStatus(String(e?.message || e), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
     async function extractZip() {
       if (!invoke) {
         setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
@@ -423,6 +450,7 @@
       }
     }
 
+    pickSavePathBtn.addEventListener('click', pickSavePath)
     pickZipBtn.addEventListener('click', pickZipForExtract)
     extractZipBtn.addEventListener('click', extractZip)
     pickOriginExeBtn.addEventListener('click', pickOriginExe)

@@ -96,6 +96,69 @@ fn powershell_exe_path() -> PathBuf {
     PathBuf::from("powershell.exe")
 }
 
+#[cfg(target_os = "windows")]
+fn env_is_falsey(key: &str) -> bool {
+    let Ok(raw) = std::env::var(key) else {
+        return false;
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "0" | "false" | "no" | "off")
+}
+
+#[cfg(target_os = "windows")]
+fn is_process_running_for_exe(exe_path: &Path) -> bool {
+    let Some(stem) = exe_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return false;
+    };
+
+    // `tasklist` output is localized, but it always prints the image name when a match exists.
+    let image_name = format!("{stem}.exe");
+    let Ok(out) = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image_name}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+
+    String::from_utf8_lossy(&out.stdout)
+        .to_ascii_lowercase()
+        .contains(&image_name.to_ascii_lowercase())
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) {
+    if !reuse_origin_ui {
+        return;
+    }
+
+    // First-run optimization: start Origin UI as early as possible so its cold-start overlaps ZIP
+    // extraction. Set `ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI=0` to disable.
+    if env_is_falsey("ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI") {
+        return;
+    }
+
+    if origin_exe.as_os_str().is_empty() || !origin_exe.exists() || !origin_exe.is_file() {
+        return;
+    }
+
+    if is_process_running_for_exe(origin_exe) {
+        return;
+    }
+
+    let mut cmd = Command::new(origin_exe);
+    if let Some(parent) = origin_exe.parent() {
+        cmd.current_dir(parent);
+    }
+    let _ = cmd.spawn();
+}
+
 /// Extract ZIP to the work directory and launch Origin UI.
 /// Returns the extracted directory path.
 #[cfg(target_os = "windows")]
@@ -150,6 +213,10 @@ pub fn extract_zip_and_launch_origin(
         }
     };
 
+    // Start Origin UI early (first-run optimization) so its cold-start overlaps ZIP extraction.
+    // The PowerShell worker still owns the COM attach logic; this only affects perceived latency.
+    maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui);
+
     // Create extract directory:
     // If save_path is provided: [Save Path]\[Date]\[Zip Filename]
     // Otherwise: work_root/Extract/{zip_name}
@@ -180,13 +247,12 @@ pub fn extract_zip_and_launch_origin(
                     .unwrap_or_default()
                     .as_millis();
                 if save_path.is_some() {
-                     let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-                     extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
+                    let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
                 } else {
-                     extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+                    extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
                 }
             }
-
         } else {
             return Err(format!(
                 "Extract dir path exists but is not a directory: {}",
@@ -209,11 +275,11 @@ pub fn extract_zip_and_launch_origin(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-             if save_path.is_some() {
-                 let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-                 extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
+            if save_path.is_some() {
+                let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+                extract_dir = work_root.join(date_str).join(format!("{name_hint}_{ts}"));
             } else {
-                 extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
+                extract_dir = work_root.join("Extract").join(format!("{name_hint}_{ts}"));
             }
         }
     }
@@ -377,7 +443,10 @@ pub fn extract_zip_and_launch_origin(
     // returning "started" while nothing actually runs.
     let fast_start = std::env::var("ORIGINBRIDGE_FAST_START")
         .ok()
-        .map(|v| !v.trim().is_empty() && ["1", "true", "yes", "y", "on"].contains(&v.trim().to_ascii_lowercase().as_str()))
+        .map(|v| {
+            !v.trim().is_empty()
+                && ["1", "true", "yes", "y", "on"].contains(&v.trim().to_ascii_lowercase().as_str())
+        })
         .unwrap_or(false);
     let wait_ms = if fast_start { 0 } else { 1200 };
     if wait_ms > 0 {
@@ -1067,19 +1136,47 @@ try {
 
       $launchedUi = $false
       if (-not (Test-OriginUiRunning $originExePath)) {
+        # If the UI was started just moments ago (e.g. prelaunch from Rust), avoid starting a
+        # second Origin process while the first one is still creating its main window.
+        $originStarting = $false
         try {
-          $originWorkDir = ''
-          try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
-          if ($originWorkDir) {
-            Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath (cwd: $originWorkDir)"
-            Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
-          } else {
-            Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath"
-            Start-Process -FilePath $originExePath | Out-Null
+          $procs = @()
+          try { if ($originProcName) { $procs = @(Get-Process -Name $originProcName -ErrorAction SilentlyContinue) } } catch { $procs = @() }
+          if ($procs -and $procs.Count -gt 0) {
+            $ui = @($procs | Where-Object { $_.MainWindowHandle -ne 0 })
+            if ($ui.Count -eq 0) {
+              $now = Get-Date
+              foreach ($p in $procs) {
+                try {
+                  $age = ($now - $p.StartTime).TotalSeconds
+                  if ($age -ge 0 -and $age -lt 90) { $originStarting = $true; break }
+                } catch {
+                  # If we can't read StartTime, assume it's starting to avoid double-launch.
+                  $originStarting = $true
+                  break
+                }
+              }
+            }
           }
-          $launchedUi = $true
-        } catch {
-          Write-OriginBridgeLog "Launching Origin UI failed (will still try COM). $($_.Exception.Message)"
+        } catch { $originStarting = $false }
+
+        if ($originStarting) {
+          Write-OriginBridgeLog "Origin process is already starting; waiting for UI window before COM attach."
+        } else {
+          try {
+            $originWorkDir = ''
+            try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
+            if ($originWorkDir) {
+              Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath (cwd: $originWorkDir)"
+              Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
+            } else {
+              Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath"
+              Start-Process -FilePath $originExePath | Out-Null
+            }
+            $launchedUi = $true
+          } catch {
+            Write-OriginBridgeLog "Launching Origin UI failed (will still try COM). $($_.Exception.Message)"
+          }
         }
 
         $uiSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1099,6 +1196,17 @@ try {
         Start-Sleep -Milliseconds 3000
       }
 
+      $progId = 'Origin.ApplicationSI'
+      try {
+        $active = [System.Runtime.InteropServices.Marshal]::GetActiveObject($progId)
+        if ($active) {
+          Write-OriginBridgeLog "Attached to running Origin COM via GetActiveObject: $progId"
+          return @{ ProgId = $progId; Object = $active; LaunchedUi = $launchedUi }
+        }
+      } catch {
+        # ignore
+      }
+
       $attachSw = [System.Diagnostics.Stopwatch]::StartNew()
       while ($attachSw.ElapsedMilliseconds -lt 20000) {
         $before = @()
@@ -1107,7 +1215,6 @@ try {
         try { $beforeIds = @($before | ForEach-Object { $_.Id }) } catch { $beforeIds = @() }
 
         try {
-          $progId = 'Origin.ApplicationSI'
           Write-Host "Trying Origin COM ProgID (UI attach): $progId"
           $obj = New-Object -ComObject $progId
 

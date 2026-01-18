@@ -1611,7 +1611,29 @@ try {
       $origin = $null
       exit 0
     }
-    Write-OriginBridgeLog "UI automation enabled; will Save() and keep Origin open (no Exit()/relaunch)."
+    Write-OriginBridgeLog "UI automation enabled; keeping results in current project (Untitled). Skipping Save()/Exit()."
+    Close-LeftoverStartupBook1AfterSaveIfAny $origin '' $uiLaunched
+    try { $origin.EndSession() | Out-Null } catch {}
+    Start-OriginBridgeCleanup $WorkDir '' ''
+    try { Release-ComObject $origin } catch {}
+    $origin = $null
+    exit 0
+  }
+
+  if ($multiInstanceUi) {
+    try { $origin.Visible = $MAINWND_SHOW_BRING_TO_FRONT } catch {}
+    try { $origin.Execute('win -a;') | Out-Null } catch {}
+    try {
+      $ws = New-Object -ComObject 'WScript.Shell'
+      $null = $ws.AppActivate('Origin')
+    } catch {}
+    Write-OriginBridgeLog "Multi-instance UI enabled; keeping results in this Origin instance (Untitled). Skipping Save()/Exit()."
+    Close-LeftoverStartupBook1AfterSaveIfAny $origin '' $uiLaunched
+    try { $origin.EndSession() | Out-Null } catch {}
+    Start-OriginBridgeCleanup $WorkDir '' ''
+    try { Release-ComObject $origin } catch {}
+    $origin = $null
+    exit 0
   }
 
   $projName = "originbridge.opju"

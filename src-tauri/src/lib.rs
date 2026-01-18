@@ -54,7 +54,7 @@ fn extract_zip_and_open_origin(
             // Auto-detect if not configured
             let candidates = utils::settings::detect_origin_exe_candidates(false)
                 .map_err(|e| format!("Auto-detection failed: {e}"))?;
-            
+
             if let Some(arr) = candidates.as_array() {
                 if let Some(first) = arr.first() {
                     if let Some(path_str) = first.get("path").and_then(|v| v.as_str()) {
@@ -64,8 +64,9 @@ fn extract_zip_and_open_origin(
             }
         }
 
-        let origin_exe = origin_exe
-            .ok_or_else(|| "Origin 可执行文件未配置，且自动检测未找到 Origin，请手动配置。".to_string())?;
+        let origin_exe = origin_exe.ok_or_else(|| {
+            "Origin 可执行文件未配置，且自动检测未找到 Origin，请手动配置。".to_string()
+        })?;
 
         let result = utils::origin::extract_zip_and_launch_origin(
             std::path::Path::new(zip_path),

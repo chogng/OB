@@ -208,6 +208,10 @@
       multiZipReuseUiEl.checked = loadMultiZipReuseUiSetting()
       multiZipReuseUiEl.addEventListener('change', () => {
         saveMultiZipReuseUiSetting(Boolean(multiZipReuseUiEl.checked))
+        if (multiZipReuseUiEl.checked) {
+          // Warm up Origin early so the first plot starts faster in single-window mode.
+          maybePrelaunchOriginUi()
+        }
       })
     }
 
@@ -262,6 +266,18 @@
       return (originExeEl.value || '').trim()
     }
 
+    async function maybePrelaunchOriginUi() {
+      if (!invoke) return
+      const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
+      if (!reuseOriginUi) return
+      if (!getOriginExePath()) return
+      try {
+        await invoke('prelaunch_origin_ui', { reuseOriginUi })
+      } catch {
+        // ignore
+      }
+    }
+
     function setOriginCandidates(candidates) {
       const list = Array.isArray(candidates) ? candidates : []
       originCandidatesEl.innerHTML = ''
@@ -309,6 +325,7 @@
       try {
         const saved = await invoke('set_origin_exe_path', { path: p })
         originExeEl.value = saved || p
+        maybePrelaunchOriginUi()
         setStatus('已保存 Origin 可执行文件：' + (saved || p))
       } catch (e) {
         setStatus(String(e?.message || e), true)
@@ -501,8 +518,8 @@
         setStatus(
           results.join('\n\n') +
           (reuseOriginUi
-            ? '\n\n后台将自动执行 OGS 并在当前 Origin 窗口中出图（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
-            : '\n\n后台将自动执行 OGS 并为每个 ZIP 启动一个新的 Origin 窗口出图（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。')
+            ? '\n\n后台将自动执行 OGS，并在出图完成后自动打开/置前当前 Origin 窗口（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
+            : '\n\n后台将自动执行 OGS，并在出图完成后为每个 ZIP 自动打开/置前一个新的 Origin 窗口出图（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。')
         )
       } catch (e) {
         setStatus(String(e?.message || e), true)
@@ -525,6 +542,8 @@
 
     setPickedZipPaths([])
     refreshOriginExePath().finally(() => {
+      // Warm up Origin early so the first plot starts faster in single-window mode.
+      maybePrelaunchOriginUi()
       if (!getOriginExePath()) setStatus('请先配置 Origin 可执行文件路径。', true)
       else setStatus('就绪。')
     })

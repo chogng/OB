@@ -67,6 +67,44 @@ fn get_origin_running_process_count() -> Result<u32, String> {
 }
 
 #[tauri::command]
+fn prelaunch_origin_ui(reuse_origin_ui: Option<bool>) -> Result<bool, String> {
+    let reuse_origin_ui = reuse_origin_ui.unwrap_or(true);
+    if !reuse_origin_ui {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut origin_exe = utils::settings::get_origin_exe_path()?;
+
+        if origin_exe.is_none() {
+            // Auto-detect if not configured (best-effort).
+            let candidates = utils::settings::detect_origin_exe_candidates(false)
+                .map_err(|e| format!("Auto-detection failed: {e}"))?;
+
+            if let Some(arr) = candidates.as_array() {
+                if let Some(first) = arr.first() {
+                    if let Some(path_str) = first.get("path").and_then(|v| v.as_str()) {
+                        origin_exe = Some(std::path::PathBuf::from(path_str));
+                    }
+                }
+            }
+        }
+
+        if let Some(origin_exe) = origin_exe {
+            return Ok(utils::origin::prelaunch_origin_ui(&origin_exe));
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 fn extract_zip_and_open_origin(
     zip_path: String,
     save_path: Option<String>,
@@ -130,6 +168,7 @@ pub fn run() {
             clear_origin_exe_path,
             detect_origin_exe_candidates,
             get_origin_running_process_count,
+            prelaunch_origin_ui,
             extract_zip_and_open_origin
         ])
         .setup(|_app| Ok(()))

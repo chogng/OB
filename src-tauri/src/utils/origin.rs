@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 fn ensure_dir(path: &Path) -> Result<(), String> {
@@ -106,7 +107,7 @@ fn env_is_falsey(key: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn is_process_running_for_exe(exe_path: &Path) -> bool {
+fn is_ui_window_running_for_exe(exe_path: &Path) -> bool {
     let Some(stem) = exe_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -115,21 +116,26 @@ fn is_process_running_for_exe(exe_path: &Path) -> bool {
         return false;
     };
 
-    // `tasklist` output is localized, but it always prints the image name when a match exists.
-    let image_name = format!("{stem}.exe");
-    let Ok(out) = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {image_name}"), "/NH"])
+    fn escape_ps_single_quoted(s: &str) -> String {
+        // PowerShell single-quoted string escaping: '' => '
+        s.replace('\'', "''")
+    }
+
+    let stem_arg = escape_ps_single_quoted(stem);
+    let ps_cmd = format!(
+        "$n = '{stem_arg}'; \
+         $p = Get-Process -Name $n -ErrorAction SilentlyContinue; \
+         if ($p -and (@($p | Where-Object {{ $_.MainWindowHandle -ne 0 }}).Count -gt 0)) {{ exit 0 }} else {{ exit 1 }}"
+    );
+
+    let Ok(out) = Command::new(powershell_exe_path())
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd])
         .output()
     else {
         return false;
     };
-    if !out.status.success() {
-        return false;
-    }
 
-    String::from_utf8_lossy(&out.stdout)
-        .to_ascii_lowercase()
-        .contains(&image_name.to_ascii_lowercase())
+    out.status.success()
 }
 
 #[cfg(target_os = "windows")]
@@ -166,8 +172,8 @@ fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
         return false;
     }
 
-    // First-run optimization: start Origin UI as early as possible so its cold-start overlaps ZIP
-    // extraction. Set `ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI=0` to disable.
+    // First-run optimization: start a headless Origin automation instance as early as possible
+    // so its cold-start overlaps ZIP extraction. Set `ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI=0` to disable.
     if env_is_falsey("ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI") {
         return false;
     }
@@ -176,15 +182,93 @@ fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
         return false;
     }
 
-    if is_process_running_for_exe(origin_exe) {
+    // If Origin UI is already open, don't start a hidden keepalive that could keep the user's
+    // UI process alive after they close it.
+    if is_ui_window_running_for_exe(origin_exe) {
         return false;
     }
 
-    let mut cmd = Command::new(origin_exe);
-    if let Some(parent) = origin_exe.parent() {
-        cmd.current_dir(parent);
+    // Keepalive process: holds a COM reference to Origin.ApplicationSI so the Origin process can
+    // be prelaunched (headless) without showing a UI window. Worker jobs attach to that instance.
+    static KEEPALIVE: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+    let lock = KEEPALIVE.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = lock.lock() else {
+        return false;
+    };
+    if let Some(child) = guard.as_mut() {
+        if let Ok(None) = child.try_wait() {
+            // Still running.
+            return true;
+        }
     }
-    cmd.spawn().is_ok()
+    *guard = None;
+
+    let parent_pid = std::process::id();
+    let origin_proc_name = origin_exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Origin")
+        .replace('\'', "''");
+    let ps_cmd = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$ParentPid = {parent_pid}
+$OriginProcName = '{origin_proc_name}'
+try {{
+  $origin = New-Object -ComObject 'Origin.ApplicationSI'
+}} catch {{
+  exit 1
+}}
+try {{
+  try {{ $origin.Visible = 0 }} catch {{}}
+}} catch {{}}
+
+# Hold a COM reference while Origin is headless so the process stays warm, but release it as
+# soon as a UI window appears (otherwise Origin may refuse to close due to automation control).
+while ($true) {{
+  try {{
+    $p = Get-Process -Name $OriginProcName -ErrorAction SilentlyContinue
+    if ($p -and (@($p | Where-Object {{ $_.MainWindowHandle -ne 0 }}).Count -gt 0)) {{ break }}
+  }} catch {{}}
+
+  try {{
+    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {{ break }}
+  }} catch {{ break }}
+
+  Start-Sleep -Milliseconds 800
+}}
+
+try {{ [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($origin) }} catch {{}}
+"#
+    );
+
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new(powershell_exe_path());
+        c.creation_flags(0x08000000); // CREATE_NO_WINDOW (hide PowerShell)
+        c
+    };
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &ps_cmd,
+    ]);
+
+    match cmd.spawn() {
+        Ok(child) => {
+            *guard = Some(child);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn prelaunch_origin_ui(origin_exe: &Path) -> bool {
+    // UI prelaunch only makes sense for the "reuse UI" (single-window) flow.
+    maybe_prelaunch_origin_ui(origin_exe, true)
 }
 
 /// Extract ZIP to the work directory and launch Origin UI.
@@ -241,9 +325,9 @@ pub fn extract_zip_and_launch_origin(
         }
     };
 
-    // Start Origin UI early (first-run optimization) so its cold-start overlaps ZIP extraction.
-    // The PowerShell worker still owns the COM attach logic; this only affects perceived latency.
-    let ui_prelaunched = maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui);
+    // Prelaunch a headless Origin automation instance early (first-run optimization) so its
+    // cold-start overlaps ZIP extraction. The PowerShell worker still owns the COM attach logic.
+    let _instance_prelaunched = maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui);
 
     // Create extract directory:
     // If save_path is provided: [Save Path]\[Date]\[Zip Filename]
@@ -440,8 +524,8 @@ pub fn extract_zip_and_launch_origin(
         c
     };
 
-    // Controlled by UI: reuse a single Origin UI instance for automation to avoid the
-    // expensive Origin COM shutdown path (EndSession/Exit/Release) on every job.
+    // Controlled by UI: reuse a single Origin instance (ApplicationSI) to avoid the expensive
+    // Origin COM shutdown path (EndSession/Exit/Release) on every job.
     cmd.env(
         "ORIGINBRIDGE_UI_AUTOMATION",
         if reuse_origin_ui { "1" } else { "0" },
@@ -450,17 +534,9 @@ pub fn extract_zip_and_launch_origin(
         "ORIGINBRIDGE_MULTI_INSTANCE_UI",
         if reuse_origin_ui { "0" } else { "1" },
     );
-    // If we prelaunched Origin UI (to overlap cold-start with ZIP extraction), inform the worker
-    // so it can reuse/cleanup the startup Book1 correctly.
-    cmd.env(
-        "ORIGINBRIDGE_UI_PRELAUNCHED",
-        if ui_prelaunched { "1" } else { "0" },
-    );
-    // Optional UX: close the blank startup Book1 if it remains unused (avoid N+1 books in reuse-UI mode).
-    cmd.env(
-        "ORIGINBRIDGE_CLOSE_BLANK_BOOK1",
-        if reuse_origin_ui { "1" } else { "0" },
-    );
+    // UI prelaunch is disabled (we prelaunch headless); do not apply "startup Book1" heuristics.
+    cmd.env("ORIGINBRIDGE_UI_PRELAUNCHED", "0");
+    cmd.env("ORIGINBRIDGE_CLOSE_BLANK_BOOK1", "0");
 
     let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
     final_args.extend(args);
@@ -1170,84 +1246,12 @@ try {
     $lastError = $null
 
     if ($preferUi) {
-      # UI automation: ensure Origin UI is running and attach to that instance.
-      # Important: If we attach too early after launching Origin, COM may spawn a second hidden
-      # Origin process (-Embedding). Detect that case, terminate the extra process, and retry.
+      # Single-instance automation: attach to Origin.ApplicationSI (headless-friendly).
+      # We intentionally do NOT launch Origin UI here; Origin can stay headless until we set Visible.
       $originProcName = ''
       try { $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath) } catch { $originProcName = '' }
 
-      $launchedUi = $false
-      if (-not (Test-OriginUiRunning $originExePath)) {
-        # If the UI was started just moments ago (e.g. prelaunch from Rust), avoid starting a
-        # second Origin process while the first one is still creating its main window.
-        $originStarting = $false
-        try {
-          $procs = @()
-          try { if ($originProcName) { $procs = @(Get-Process -Name $originProcName -ErrorAction SilentlyContinue) } } catch { $procs = @() }
-          if ($procs -and $procs.Count -gt 0) {
-            $ui = @($procs | Where-Object { $_.MainWindowHandle -ne 0 })
-            if ($ui.Count -eq 0) {
-              $now = Get-Date
-              foreach ($p in $procs) {
-                try {
-                  $age = ($now - $p.StartTime).TotalSeconds
-                  if ($age -ge 0 -and $age -lt 90) { $originStarting = $true; break }
-                } catch {
-                  # If we can't read StartTime, assume it's starting to avoid double-launch.
-                  $originStarting = $true
-                  break
-                }
-              }
-            }
-          }
-        } catch { $originStarting = $false }
-
-        if ($originStarting) {
-          Write-OriginBridgeLog "Origin process is already starting; waiting for UI window before COM attach."
-        } else {
-          try {
-            $originWorkDir = ''
-            try { $originWorkDir = Split-Path -Parent $originExePath } catch { $originWorkDir = '' }
-            if ($originWorkDir) {
-              Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath (cwd: $originWorkDir)"
-              Start-Process -FilePath $originExePath -WorkingDirectory $originWorkDir | Out-Null
-            } else {
-              Write-OriginBridgeLog "UI automation enabled; launching Origin UI: $originExePath"
-              Start-Process -FilePath $originExePath | Out-Null
-            }
-            $launchedUi = $true
-          } catch {
-            Write-OriginBridgeLog "Launching Origin UI failed (will still try COM). $($_.Exception.Message)"
-          }
-        }
-
-        $uiSw = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($uiSw.ElapsedMilliseconds -lt 20000) {
-          if (Test-OriginUiRunning $originExePath) { break }
-          Start-Sleep -Milliseconds 300
-        }
-        $uiSw.Stop()
-        Write-OriginBridgeLog "Origin UI wait before COM attach: $($uiSw.ElapsedMilliseconds) ms (running=$((Test-OriginUiRunning $originExePath)))"
-      } else {
-        Write-OriginBridgeLog "UI automation enabled; Origin UI already running."
-      }
-
-      if ($launchedUi) {
-        # Give Origin time to finish initializing COM inside the UI process.
-        # Attaching too early can spawn a second hidden -Embedding process.
-        Start-Sleep -Milliseconds 3000
-      }
-
       $progId = 'Origin.ApplicationSI'
-      try {
-        $active = [System.Runtime.InteropServices.Marshal]::GetActiveObject($progId)
-        if ($active) {
-          Write-OriginBridgeLog "Attached to running Origin COM via GetActiveObject: $progId"
-          return @{ ProgId = $progId; Object = $active; LaunchedUi = $launchedUi }
-        }
-      } catch {
-        # ignore
-      }
 
       $attachSw = [System.Diagnostics.Stopwatch]::StartNew()
       while ($attachSw.ElapsedMilliseconds -lt 20000) {
@@ -1257,18 +1261,20 @@ try {
         try { $beforeIds = @($before | ForEach-Object { $_.Id }) } catch { $beforeIds = @() }
 
         try {
-          Write-Host "Trying Origin COM ProgID (UI attach): $progId"
+          Write-Host "Trying Origin COM ProgID (single-instance): $progId"
           $obj = New-Object -ComObject $progId
 
           $after = @()
           try { if ($originProcName) { $after = @(Get-Process -Name $originProcName -ErrorAction SilentlyContinue) } } catch { $after = @() }
           $newProcs = @()
           try { $newProcs = @($after | Where-Object { $beforeIds -notcontains $_.Id }) } catch { $newProcs = @() }
+          $newPids = @()
+          try { $newPids = @($newProcs | ForEach-Object { $_.Id }) } catch { $newPids = @() }
           $newHidden = @()
           try { $newHidden = @($newProcs | Where-Object { $_.MainWindowHandle -eq 0 }) } catch { $newHidden = @() }
 
-          if ($newHidden.Count -gt 0) {
-            Write-OriginBridgeLog "COM attach spawned extra Origin process(es) (likely -Embedding). Waiting for UI COM readiness and retrying."
+          if (($beforeIds.Count -gt 0) -and ($newHidden.Count -gt 0)) {
+            Write-OriginBridgeLog "COM attach spawned extra Origin process(es) while an instance already exists; retrying."
             try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($obj) } catch {}
             $obj = $null
             foreach ($p in $newHidden) {
@@ -1278,14 +1284,14 @@ try {
             continue
           }
 
-          return @{ ProgId = $progId; Object = $obj; LaunchedUi = $launchedUi }
+          return @{ ProgId = $progId; Object = $obj; LaunchedUi = $false; SpawnedPids = $newPids }
         } catch {
           $lastError = $_
           Start-Sleep -Milliseconds 300
         }
       }
 
-      $msg = "Could not attach to Origin UI COM instance (ApplicationSI). Please start Origin manually and retry."
+      $msg = "Could not create/attach Origin COM instance (ApplicationSI)."
       if ($lastError) { $msg = "$msg`nLast error: $($lastError.Exception.Message)" }
       throw $msg
     }
@@ -1353,32 +1359,34 @@ try {
     }
   }
 
-  try {
-    $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath)
-    $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
-    if ($all) {
-      $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 })
-      if (($ui.Count -eq 0) -and ($all.Count -ge 2)) {
-        # This can be transient during Origin startup (e.g. UI prelaunch): multiple Origin64.exe
-        # processes may exist briefly before the main window is created.
-        Write-OriginBridgeLog "Detected multiple Origin processes but no UI window yet; waiting briefly for UI startup..."
-        $uiWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($uiWaitSw.ElapsedMilliseconds -lt 20000) {
-          if (Test-OriginUiRunning $originExePath) { break }
-          Start-Sleep -Milliseconds 300
-        }
-        $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
-        $ui = @()
-        if ($all) { $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 }) }
-        if (($ui.Count -eq 0) -and ($all) -and ($all.Count -ge 2)) {
-          throw "Detected multiple Origin processes but no UI window is visible. Please close Origin and end all $originProcName.exe processes in Task Manager, then retry."
+  if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) {
+    try {
+      $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath)
+      $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
+      if ($all) {
+        $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 })
+        if (($ui.Count -eq 0) -and ($all.Count -ge 2)) {
+          # This can be transient during Origin startup (e.g. UI launch): multiple Origin64.exe
+          # processes may exist briefly before the main window is created.
+          Write-OriginBridgeLog "Detected multiple Origin processes but no UI window yet; waiting briefly for UI startup..."
+          $uiWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
+          while ($uiWaitSw.ElapsedMilliseconds -lt 20000) {
+            if (Test-OriginUiRunning $originExePath) { break }
+            Start-Sleep -Milliseconds 300
+          }
+          $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
+          $ui = @()
+          if ($all) { $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 }) }
+          if (($ui.Count -eq 0) -and ($all) -and ($all.Count -ge 2)) {
+            throw "Detected multiple Origin processes but no UI window is visible. Please close Origin and end all $originProcName.exe processes in Task Manager, then retry."
+          }
         }
       }
+    } catch {
+      $msg = $_.Exception.Message
+      Write-OriginBridgeLog "Origin process state check: $msg"
+      if ($msg -like 'Detected multiple Origin processes*') { throw }
     }
-  } catch {
-    $msg = $_.Exception.Message
-    Write-OriginBridgeLog "Origin process state check: $msg"
-    if ($msg -like 'Detected multiple Origin processes*') { throw }
   }
 
   $origin = $null
@@ -1389,7 +1397,7 @@ try {
   $preferUiAutomation = Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION
   $multiInstanceUi = Test-EnvTruthy $env:ORIGINBRIDGE_MULTI_INSTANCE_UI
   if ($preferUiAutomation) {
-    Write-OriginBridgeLog "UI automation mode: ON (use Origin UI instance; keep Origin running; no Exit()/relaunch). Set ORIGINBRIDGE_UI_AUTOMATION=0 to disable."
+    Write-OriginBridgeLog "Single-instance mode: ON (Origin.ApplicationSI; keep Origin running; show UI only after job). Set ORIGINBRIDGE_UI_AUTOMATION=0 to disable."
   } elseif ($multiInstanceUi) {
     Write-OriginBridgeLog "Multi-instance UI mode: ON (each ZIP launches a new Origin instance; keep Origin running; no Exit()/relaunch)."
   } else {
@@ -1468,10 +1476,15 @@ try {
   }
 
   # NOTE:
-  # - UI automation mode: attach to Origin UI instance and keep Origin running (no Exit()/relaunch).
+  # - Single-instance mode: attach to Origin.ApplicationSI and keep Origin running (no Exit()/relaunch).
   # - Multi-instance UI mode: create a new Origin instance per job and keep Origin running (no Exit()/relaunch).
   # - Legacy non-UI mode: keep the automation instance hidden, Save() to .opju, Exit(), then relaunch UI to open the .opju.
-  if ($preferUiAutomation -or $multiInstanceUi) {
+  if ($preferUiAutomation) {
+    # Keep headless until the job finishes; then we will show the UI.
+    if (-not (Test-OriginUiRunning $originExePath)) {
+      try { $origin.Visible = $MAINWND_HIDE } catch {}
+    }
+  } elseif ($multiInstanceUi) {
     try { $origin.Visible = $MAINWND_SHOW } catch {}
   } elseif (-not $attachedToUiInstance) {
     try { $origin.Visible = $MAINWND_HIDE } catch {}

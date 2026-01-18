@@ -133,30 +133,30 @@ fn is_process_running_for_exe(exe_path: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) {
+fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
     if !reuse_origin_ui {
-        return;
+        return false;
     }
 
     // First-run optimization: start Origin UI as early as possible so its cold-start overlaps ZIP
     // extraction. Set `ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI=0` to disable.
     if env_is_falsey("ORIGINBRIDGE_PRELAUNCH_ORIGIN_UI") {
-        return;
+        return false;
     }
 
     if origin_exe.as_os_str().is_empty() || !origin_exe.exists() || !origin_exe.is_file() {
-        return;
+        return false;
     }
 
     if is_process_running_for_exe(origin_exe) {
-        return;
+        return false;
     }
 
     let mut cmd = Command::new(origin_exe);
     if let Some(parent) = origin_exe.parent() {
         cmd.current_dir(parent);
     }
-    let _ = cmd.spawn();
+    cmd.spawn().is_ok()
 }
 
 /// Extract ZIP to the work directory and launch Origin UI.
@@ -215,7 +215,7 @@ pub fn extract_zip_and_launch_origin(
 
     // Start Origin UI early (first-run optimization) so its cold-start overlaps ZIP extraction.
     // The PowerShell worker still owns the COM attach logic; this only affects perceived latency.
-    maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui);
+    let ui_prelaunched = maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui);
 
     // Create extract directory:
     // If save_path is provided: [Save Path]\[Date]\[Zip Filename]
@@ -421,6 +421,17 @@ pub fn extract_zip_and_launch_origin(
     cmd.env(
         "ORIGINBRIDGE_MULTI_INSTANCE_UI",
         if reuse_origin_ui { "0" } else { "1" },
+    );
+    // If we prelaunched Origin UI (to overlap cold-start with ZIP extraction), inform the worker
+    // so it can reuse/cleanup the startup Book1 correctly.
+    cmd.env(
+        "ORIGINBRIDGE_UI_PRELAUNCHED",
+        if ui_prelaunched { "1" } else { "0" },
+    );
+    // Optional UX: close the blank startup Book1 if it remains unused (avoid N+1 books in reuse-UI mode).
+    cmd.env(
+        "ORIGINBRIDGE_CLOSE_BLANK_BOOK1",
+        if reuse_origin_ui { "1" } else { "0" },
     );
 
     let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
@@ -914,7 +925,8 @@ function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath, [bool]$c
 }
 
 function Close-LeftoverStartupBook1AfterSaveIfAny([__ComObject]$origin, [string]$projectSearchText, [bool]$launchedUi = $false) {
-  if (-not $launchedUi) { return }
+  $closeBlank = $launchedUi -or (Test-EnvTruthy $env:ORIGINBRIDGE_CLOSE_BLANK_BOOK1)
+  if (-not $closeBlank) { return }
 
   try {
     $pages = $projectSearchText
@@ -1317,7 +1329,20 @@ try {
     if ($all) {
       $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 })
       if (($ui.Count -eq 0) -and ($all.Count -ge 2)) {
-        throw "Detected multiple Origin processes but no UI window is visible. Please close Origin and end all $originProcName.exe processes in Task Manager, then retry."
+        # This can be transient during Origin startup (e.g. UI prelaunch): multiple Origin64.exe
+        # processes may exist briefly before the main window is created.
+        Write-OriginBridgeLog "Detected multiple Origin processes but no UI window yet; waiting briefly for UI startup..."
+        $uiWaitSw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($uiWaitSw.ElapsedMilliseconds -lt 20000) {
+          if (Test-OriginUiRunning $originExePath) { break }
+          Start-Sleep -Milliseconds 300
+        }
+        $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
+        $ui = @()
+        if ($all) { $ui = @($all | Where-Object { $_.MainWindowHandle -ne 0 }) }
+        if (($ui.Count -eq 0) -and ($all) -and ($all.Count -ge 2)) {
+          throw "Detected multiple Origin processes but no UI window is visible. Please close Origin and end all $originProcName.exe processes in Task Manager, then retry."
+        }
       }
     }
   } catch {
@@ -1361,6 +1386,7 @@ try {
     $originProgId = $originInfo.ProgId
     $origin = $originInfo.Object
     try { $uiLaunched = [bool]$originInfo.LaunchedUi } catch { $uiLaunched = $false }
+    if (Test-EnvTruthy $env:ORIGINBRIDGE_UI_PRELAUNCHED) { $uiLaunched = $true }
     try { $originSpawnedPids = @($originInfo.SpawnedPids) } catch { $originSpawnedPids = @() }
     $attachedToUiInstance = ($originProgId -eq 'Origin.ApplicationSI')
     Write-OriginBridgeLog "Origin COM created in $($comSw.ElapsedMilliseconds) ms. ProgID: $originProgId"

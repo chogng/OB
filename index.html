@@ -108,20 +108,7 @@
       cursor: not-allowed;
     }
 
-    .status {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid rgba(127, 127, 127, 0.25);
-      background: rgba(127, 127, 127, 0.08);
-      font-size: 12px;
-      white-space: pre-wrap;
-    }
 
-    .status.error {
-      border-color: rgba(220, 38, 38, 0.35);
-      background: rgba(220, 38, 38, 0.08);
-    }
 
     details {
       margin-top: 18px;
@@ -163,21 +150,21 @@
     <div class="row" style="margin-top: 10px">
       <button id="pickZipBtn">选择 ZIP</button>
       <button id="extractZipBtn">打开origin</button>
-      <label class="checkbox" title="勾选：多个 ZIP 复用同一个 Origin 窗口（多 ZIP -> 多 sheet/book）。不勾选：多进程窗口模式（待实现）。">
+      <label class="checkbox" title="勾选：所有文件在同一个 Origin 窗口中处理。不勾选：每个文件启动一个新的 Origin 窗口。">
         <input id="multiZipReuseUi" type="checkbox" checked />
-        多 ZIP 复用 Origin
+        单窗口模式
       </label>
-      <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
+
     </div>
 
-    <div id="status" class="status">Loading...</div>
+
   </div>
 
   <script type="module">
     import { invoke } from '@tauri-apps/api/core'
     import { open } from '@tauri-apps/plugin-dialog'
 
-    const statusEl = document.getElementById('status')
+
 
     const originExeEl = document.getElementById('originExe')
     const pickOriginExeBtn = document.getElementById('pickOriginExeBtn')
@@ -190,7 +177,7 @@
     const extractZipBtn = document.getElementById('extractZipBtn')
     const multiZipReuseUiEl = document.getElementById('multiZipReuseUi')
 
-    const pickedZipPathEl = document.getElementById('pickedZipPath')
+
     const savePathEl = document.getElementById('savePath')
     const pickSavePathBtn = document.getElementById('pickSavePathBtn')
 
@@ -258,13 +245,16 @@
     }
 
     function setStatus(msg, isError = false) {
-      statusEl.textContent = msg
-      statusEl.classList.toggle('error', Boolean(isError))
+      if (isError) {
+        console.error(msg)
+      } else {
+        console.log(msg)
+      }
     }
 
     function setPickedZipPaths(paths) {
       pickedZipPaths = normalizePickedPaths(paths)
-      pickedZipPathEl.textContent = formatPickedPathsForInline(pickedZipPaths)
+      // pickedZipPathEl.textContent = formatPickedPathsForInline(pickedZipPaths)
       if (!isBusy) extractZipBtn.disabled = !pickedZipPaths.length
     }
 

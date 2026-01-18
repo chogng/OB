@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "csv": "result.csv",
+  "template": "template.otpu",
+  "graphs": [
+    {
+      "name": "AllCurves",
+      "layer": 0,
+      "series": [
+        { "x": "x1", "y": "y1", "label": "curve1", "type": 202 },
+        { "x": "x2", "y": "y2", "label": "curve2", "type": 202 }
+      ]
+    }
+  ],
+  "output": {
+    "projectName": "originbridge.opju"
+  }
+}
+

@@ -176,6 +176,8 @@
     const pickZipBtn = document.getElementById('pickZipBtn')
     const extractZipBtn = document.getElementById('extractZipBtn')
     const multiZipReuseUiEl = document.getElementById('multiZipReuseUi')
+    let plotModeEl = document.getElementById('plotMode')
+    let workerKindEl = document.getElementById('workerKind')
 
 
     const savePathEl = document.getElementById('savePath')
@@ -185,6 +187,8 @@
     let isBusy = false
 
     const STORAGE_KEY_MULTI_ZIP_REUSE_UI = 'originbridge.multiZipReuseUi'
+    const STORAGE_KEY_PLOT_MODE = 'originbridge.plotMode'
+    const STORAGE_KEY_WORKER_KIND = 'originbridge.workerKind'
 
     function loadMultiZipReuseUiSetting() {
       try {
@@ -215,6 +219,99 @@
       })
     }
 
+    function ensurePlotModeControl() {
+      if (plotModeEl) return plotModeEl
+      const row = multiZipReuseUiEl?.closest?.('.row')
+      if (!row) return null
+
+      const label = document.createElement('span')
+      label.style.marginLeft = '10px'
+      label.textContent = '绘图模式'
+
+      const select = document.createElement('select')
+      select.id = 'plotMode'
+      select.title = '多对 XY 时：同一图多曲线 或 每对一图'
+      select.innerHTML =
+        '<option value="single">同一图多曲线</option><option value="multi">每对一图</option>'
+
+      row.appendChild(label)
+      row.appendChild(select)
+
+      plotModeEl = select
+      return plotModeEl
+    }
+
+    function ensureWorkerKindControl() {
+      if (workerKindEl) return workerKindEl
+      const row = multiZipReuseUiEl?.closest?.('.row')
+      if (!row) return null
+
+      const label = document.createElement('span')
+      label.style.marginLeft = '10px'
+      label.textContent = '绘图引擎'
+
+      const select = document.createElement('select')
+      select.id = 'workerKind'
+      select.title = '自动：有 plot.json 优先 Python；否则 PowerShell。Python 需要 originpro 环境。'
+      select.innerHTML =
+        '<option value="auto">自动</option><option value="powershell">PowerShell（OGS/兼容）</option><option value="python">Python（originpro）</option>'
+
+      row.appendChild(label)
+      row.appendChild(select)
+
+      workerKindEl = select
+      return workerKindEl
+    }
+
+    function loadPlotModeSetting() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY_PLOT_MODE)
+        const v = String(raw || '').trim().toLowerCase()
+        return v === 'multi' ? 'multi' : 'single'
+      } catch {
+        return 'single'
+      }
+    }
+
+    function savePlotModeSetting(v) {
+      try {
+        const vv = String(v || '').trim().toLowerCase()
+        localStorage.setItem(STORAGE_KEY_PLOT_MODE, vv === 'multi' ? 'multi' : 'single')
+      } catch {
+        // ignore
+      }
+    }
+
+    if (ensurePlotModeControl()) {
+      plotModeEl.value = loadPlotModeSetting()
+      plotModeEl.addEventListener('change', () => savePlotModeSetting(plotModeEl.value))
+    }
+
+    function loadWorkerKindSetting() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY_WORKER_KIND)
+        const v = String(raw || '').trim().toLowerCase()
+        if (v === 'python' || v === 'powershell') return v
+        return 'auto'
+      } catch {
+        return 'auto'
+      }
+    }
+
+    function saveWorkerKindSetting(v) {
+      try {
+        const vv = String(v || '').trim().toLowerCase()
+        localStorage.setItem(STORAGE_KEY_WORKER_KIND, vv === 'python' || vv === 'powershell' ? vv : 'auto')
+      } catch {
+        // ignore
+      }
+    }
+
+    if (ensureWorkerKindControl()) {
+      workerKindEl.value = loadWorkerKindSetting()
+      workerKindEl.addEventListener('change', () => saveWorkerKindSetting(workerKindEl.value))
+    }
+
     function normalizePickedPaths(selected) {
       if (!selected) return []
       if (Array.isArray(selected))
@@ -242,6 +339,8 @@
         pickZipBtn,
         extractZipBtn,
         multiZipReuseUiEl,
+        plotModeEl,
+        workerKindEl,
       ])
         el.disabled = isBusy
 
@@ -269,7 +368,6 @@
     async function maybePrelaunchOriginUi() {
       if (!invoke) return
       const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
-      if (!reuseOriginUi) return
       if (!getOriginExePath()) return
       try {
         await invoke('prelaunch_origin_ui', { reuseOriginUi })
@@ -465,6 +563,11 @@
       }
 
       const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
+      const plotMode =
+        String(plotModeEl?.value || 'single').trim().toLowerCase() === 'multi' ? 'multi' : 'single'
+      const workerKindRaw = String(workerKindEl?.value || 'auto').trim().toLowerCase()
+      const workerKind =
+        workerKindRaw === 'python' || workerKindRaw === 'powershell' ? workerKindRaw : 'auto'
 
       if (!reuseOriginUi && pickedZipPaths.length) {
         let running = 0
@@ -503,6 +606,8 @@
               zipPath,
               savePath,
               reuseOriginUi,
+              plotMode,
+              workerKind,
             })
             const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
             const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''

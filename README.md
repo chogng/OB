@@ -5,7 +5,9 @@ OriginBridge 是一个 Windows 桌面应用（Tauri 2 + Rust + Vite），用于�
 ## 功能特点
 
 - **ZIP 出图**：选择 `device_analysis_origin.zip` 后，自动解压并出图
-- **Origin 自动化**：优先执行包内 `.ogs` 脚本；失败时回退到 CSV 导入 + `plotxy`
+- **双引擎**：
+  - **PowerShell worker（默认/兼容）**：优先执行包内 `.ogs` 脚本；失败时回退到 CSV 导入 + `plotxy`
+  - **Python worker（可选/plot.json）**：读取 `plot.json` + `csv` 直接绘图，支持复用 `.otpu` 模板（依赖 `originpro`）
 - **可追溯**：每次任务保留 PowerShell 执行脚本与详细日志
 
 ## 使用方法
@@ -16,6 +18,14 @@ OriginBridge 是一个 Windows 桌面应用（Tauri 2 + Rust + Vite），用于�
 2. 点击 **“解压 ZIP”**（如未先选择 ZIP，会自动弹出选择框）
 3. 选择从 Appointer 下载的 `device_analysis_origin.zip`
 4. 等待片刻，Origin 将自动打开并展示出图结果
+
+### 绘图模式/引擎选择
+
+界面中提供两个选项（会记住上次选择）：
+
+- **绘图模式**：多对 XY 时选择「同一图多曲线」或「每对一图」（主要影响 CSV fallback / 未提供 `plot.json` 的情况；如提供 `plot.json`，建议用 `graphs` 显式表达多图）
+- **绘图引擎**：`自动 / PowerShell / Python`
+  - `自动`：检测到 `plot.json` 时优先 Python，否则 PowerShell；若 Python 环境不可用会自动降级到 PowerShell
 
 ### 工作目录
 
@@ -43,6 +53,9 @@ OriginBridge 是一个 Windows 桌面应用（Tauri 2 + Rust + Vite），用于�
 3. **权限/杀软/策略限制**
    - 确保 ZIP 所在目录有写入权限（解压目录会创建在同级目录下）
    - 本项目会在后台启动 PowerShell worker（`-ExecutionPolicy Bypass`），如企业策略限制 PowerShell 请放行
+4. **Python worker 无法使用**
+   - 运行 `scripts\\setup_ob_venv.ps1` 创建本地虚拟环境并安装依赖（默认 venv 目录为 `ob\\`）
+   - 或设置环境变量 `ORIGINBRIDGE_PYTHON_EXE` 指向可用的 `python.exe`
 
 ## 开发指南
 
@@ -51,12 +64,19 @@ OriginBridge 是一个 Windows 桌面应用（Tauri 2 + Rust + Vite），用于�
 - **前端**：Vanilla JavaScript + Tauri API（`index.html`）
 - **后端**：Rust（Tauri 2.x，`src-tauri/src`）
 - **自动化**：Windows COM + PowerShell worker（Origin Automation）
+  - 可选：Python `originpro`（用于 `plot.json` + `csv` 绘图）
 
 ### 开发环境设置
 
 ```powershell
 npm install
 npm run tauri:dev
+```
+
+### plot.json 冒烟（无需 Origin）
+
+```powershell
+.\scripts\smoke_test_plot_json.ps1
 ```
 
 ### 构建发布版本

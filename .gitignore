@@ -26,3 +26,13 @@ Thumbs.db
 nul
 *.snow
 .trae
+
+# Python virtualenv (created by scripts/setup_ob_venv.ps1)
+ob/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Codex scratch outputs
+target-codex*/

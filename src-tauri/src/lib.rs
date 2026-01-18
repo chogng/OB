@@ -69,9 +69,6 @@ fn get_origin_running_process_count() -> Result<u32, String> {
 #[tauri::command]
 fn prelaunch_origin_ui(reuse_origin_ui: Option<bool>) -> Result<bool, String> {
     let reuse_origin_ui = reuse_origin_ui.unwrap_or(true);
-    if !reuse_origin_ui {
-        return Ok(false);
-    }
 
     #[cfg(target_os = "windows")]
     {
@@ -92,7 +89,7 @@ fn prelaunch_origin_ui(reuse_origin_ui: Option<bool>) -> Result<bool, String> {
         }
 
         if let Some(origin_exe) = origin_exe {
-            return Ok(utils::origin::prelaunch_origin_ui(&origin_exe));
+            return Ok(utils::origin::prelaunch_origin(&origin_exe, reuse_origin_ui));
         }
 
         Ok(false)
@@ -109,6 +106,8 @@ fn extract_zip_and_open_origin(
     zip_path: String,
     save_path: Option<String>,
     reuse_origin_ui: Option<bool>,
+    plot_mode: Option<String>,
+    worker_kind: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let zip_path = zip_path.trim();
     if zip_path.is_empty() {
@@ -144,6 +143,8 @@ fn extract_zip_and_open_origin(
             &origin_exe,
             save_path,
             reuse_origin_ui,
+            plot_mode,
+            worker_kind,
         )
         .map_err(|e| format!("Failed to extract and open: {e}"))?;
         return Ok(result);

@@ -3,6 +3,12 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerKind {
+    PowerShell,
+    Python,
+}
+
 fn ensure_dir(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("Work directory path is empty".to_string());
@@ -98,12 +104,94 @@ fn powershell_exe_path() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
+fn python_exe_path() -> PathBuf {
+    if let Ok(p) = std::env::var("ORIGINBRIDGE_PYTHON_EXE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+
+    fn find_venv_python_near(start: &Path) -> Option<PathBuf> {
+        let mut cur: Option<&Path> = Some(start);
+        for _ in 0..6 {
+            let Some(dir) = cur else { break };
+            let candidate = dir.join("ob").join("Scripts").join("python.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            cur = dir.parent();
+        }
+        None
+    }
+
+    // Prefer a repo/app-local venv if present:
+    // - dev: <repo>/ob/Scripts/python.exe (note: current_dir may be <repo>/src-tauri)
+    // - bundle: <exe_dir>/ob/Scripts/python.exe (if shipped alongside the app)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(found) = find_venv_python_near(dir) {
+                return found;
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(found) = find_venv_python_near(&cwd) {
+            return found;
+        }
+    }
+
+    PathBuf::from("python")
+}
+
+#[cfg(target_os = "windows")]
+fn choose_worker_kind(extract_dir: &Path, override_kind: Option<&str>) -> (WorkerKind, bool) {
+    fn parse_kind(v: &str) -> Option<WorkerKind> {
+        let s = v.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "" | "auto" => None,
+            "python" | "py" => Some(WorkerKind::Python),
+            "powershell" | "ps" => Some(WorkerKind::PowerShell),
+            _ => None,
+        }
+    }
+
+    if let Some(v) = override_kind {
+        if let Some(kind) = parse_kind(v) {
+            return (kind, true);
+        }
+    }
+
+    if let Ok(v) = std::env::var("ORIGINBRIDGE_WORKER") {
+        if let Some(kind) = parse_kind(&v) {
+            return (kind, true);
+        }
+    }
+
+    // Default: if the new plot.json contract exists, use Python worker; otherwise keep legacy PS.
+    if extract_dir.join("plot.json").is_file() {
+        (WorkerKind::Python, false)
+    } else {
+        (WorkerKind::PowerShell, false)
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn env_is_falsey(key: &str) -> bool {
     let Ok(raw) = std::env::var(key) else {
         return false;
     };
     let v = raw.trim().to_ascii_lowercase();
     matches!(v.as_str(), "0" | "false" | "no" | "off")
+}
+
+#[cfg(target_os = "windows")]
+fn env_is_truthy(key: &str) -> bool {
+    let Ok(raw) = std::env::var(key) else {
+        return false;
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
 }
 
 #[cfg(target_os = "windows")]
@@ -168,7 +256,9 @@ pub fn origin_process_count(origin_exe: &Path) -> u32 {
 
 #[cfg(target_os = "windows")]
 fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
-    if !reuse_origin_ui {
+    // Default behavior: only prelaunch in "reuse UI" (single-window) mode.
+    // Set `ORIGINBRIDGE_PRELAUNCH_MULTI=1` to also prelaunch in multi-window mode (warm caches).
+    if !reuse_origin_ui && !env_is_truthy("ORIGINBRIDGE_PRELAUNCH_MULTI") {
         return false;
     }
 
@@ -186,6 +276,48 @@ fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
     // UI process alive after they close it.
     if is_ui_window_running_for_exe(origin_exe) {
         return false;
+    }
+
+    // Optional: prelaunch the UI window (minimized) instead of headless COM warm-up.
+    // Set `ORIGINBRIDGE_PRELAUNCH_UI=1` to enable.
+    if env_is_truthy("ORIGINBRIDGE_PRELAUNCH_UI") {
+        let origin_exe_str = origin_exe.to_string_lossy();
+        let origin_dir = origin_exe
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        fn escape_ps_single_quoted(s: &str) -> String {
+            // PowerShell single-quoted string escaping: '' => '
+            s.replace('\'', "''")
+        }
+
+        let file_arg = escape_ps_single_quoted(&origin_exe_str);
+        let ps_cmd = if !origin_dir.trim().is_empty() {
+            let dir_arg = escape_ps_single_quoted(&origin_dir);
+            format!(
+                "Start-Process -FilePath '{file_arg}' -WorkingDirectory '{dir_arg}' -WindowStyle Minimized | Out-Null"
+            )
+        } else {
+            format!(
+                "Start-Process -FilePath '{file_arg}' -WindowStyle Minimized | Out-Null"
+            )
+        };
+
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new(powershell_exe_path());
+            c.creation_flags(0x08000000); // CREATE_NO_WINDOW (hide PowerShell)
+            c
+        };
+        cmd.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &ps_cmd,
+        ]);
+        return cmd.spawn().is_ok();
     }
 
     // Keepalive process: holds a COM reference to Origin.ApplicationSI so the Origin process can
@@ -266,9 +398,8 @@ try {{ [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($or
 }
 
 #[cfg(target_os = "windows")]
-pub fn prelaunch_origin_ui(origin_exe: &Path) -> bool {
-    // UI prelaunch only makes sense for the "reuse UI" (single-window) flow.
-    maybe_prelaunch_origin_ui(origin_exe, true)
+pub fn prelaunch_origin(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
+    maybe_prelaunch_origin_ui(origin_exe, reuse_origin_ui)
 }
 
 /// Extract ZIP to the work directory and launch Origin UI.
@@ -279,6 +410,8 @@ pub fn extract_zip_and_launch_origin(
     origin_exe: &std::path::Path,
     save_path: Option<String>,
     reuse_origin_ui: bool,
+    plot_mode: Option<String>,
+    worker_kind_override: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use std::fs;
 
@@ -437,24 +570,30 @@ pub fn extract_zip_and_launch_origin(
     // Find .ogs files in the extracted content
     let ogs_paths = find_ogs_files(&extract_dir);
 
-    let script_body = build_run_script();
+    let (mut worker_kind, worker_kind_forced) =
+        choose_worker_kind(&extract_dir, worker_kind_override.as_deref());
 
-    // Worker script executed by PowerShell.
-    let worker_script_path = worker_root.join("run_origin_job.ps1");
-    fs::write(&worker_script_path, script_body)
-        .map_err(|e| format!("Failed to write worker script: {e}"))?;
+    // Always write both worker scripts for debugging + easier fallback.
+    let worker_ps_script_path = worker_root.join("run_origin_job.ps1");
+    let worker_py_script_path = worker_root.join("run_origin_job.py");
+    fs::write(&worker_ps_script_path, build_run_script())
+        .map_err(|e| format!("Failed to write PowerShell worker script: {e}"))?;
+    fs::write(&worker_py_script_path, build_run_python_script())
+        .map_err(|e| format!("Failed to write Python worker script: {e}"))?;
 
     // Write a pointer file so users can find logs easily.
     let worker_log_path = worker_root.join("originbridge.log");
     let worker_error_path = worker_root.join("error.txt");
     let trace_hint_path = worker_root.join("log_location.txt");
     let trace_hint = format!(
-        "ExtractDir: {}\nWorkDir: {}\nLog: {}\nError: {}\nWorkerScript: {}\n",
+        "ExtractDir: {}\nWorkDir: {}\nLog: {}\nError: {}\nWorkerKind: {:?}\nWorkerScriptPowerShell: {}\nWorkerScriptPython: {}\n",
         display_path_for_user(&extract_dir),
         display_path_for_user(&worker_root),
         display_path_for_user(&worker_log_path),
         display_path_for_user(&worker_error_path),
-        display_path_for_user(&worker_script_path),
+        worker_kind,
+        display_path_for_user(&worker_ps_script_path),
+        display_path_for_user(&worker_py_script_path),
     );
     let _ = fs::write(&trace_hint_path, trace_hint);
 
@@ -499,59 +638,13 @@ pub fn extract_zip_and_launch_origin(
 
     let extract_dir_arg = display_path_for_user(&extract_dir);
 
-    let script_path_arg = display_path_for_user(&worker_script_path);
+    let origin_exe_arg = display_path_for_user(origin_exe);
+    let ps_script_arg = display_path_for_user(&worker_ps_script_path);
+    let py_script_arg = display_path_for_user(&worker_py_script_path);
 
-    let mut args = vec![
-        "-NoProfile".to_string(),
-        "-ExecutionPolicy".to_string(),
-        "Bypass".to_string(),
-        "-File".to_string(),
-        script_path_arg,
-        "-WorkDir".to_string(),
-        work_dir_arg.clone(),
-        "-ExtractDir".to_string(),
-        extract_dir_arg,
-    ];
-
-    args.push("-OriginExe".to_string());
-    args.push(display_path_for_user(origin_exe));
-
-    // Run the worker in background (hidden window).
-    let mut cmd = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new(powershell_exe_path());
-        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        c
-    };
-
-    // Controlled by UI: reuse a single Origin instance (ApplicationSI) to avoid the expensive
-    // Origin COM shutdown path (EndSession/Exit/Release) on every job.
-    cmd.env(
-        "ORIGINBRIDGE_UI_AUTOMATION",
-        if reuse_origin_ui { "1" } else { "0" },
-    );
-    cmd.env(
-        "ORIGINBRIDGE_MULTI_INSTANCE_UI",
-        if reuse_origin_ui { "0" } else { "1" },
-    );
-    // UI prelaunch is disabled (we prelaunch headless); do not apply "startup Book1" heuristics.
-    cmd.env("ORIGINBRIDGE_UI_PRELAUNCHED", "0");
-    cmd.env("ORIGINBRIDGE_CLOSE_BLANK_BOOK1", "0");
-
-    let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
-    final_args.extend(args);
-
-    cmd.args(final_args);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!(
-                "Failed to spawn PowerShell worker: {e}\nError file: {}",
-                display_path_for_user(&worker_error_path)
-            );
-            write_worker_error(&msg);
-            return Err(msg);
-        }
+    let plot_mode_norm = match plot_mode.as_deref() {
+        Some(s) if s.trim().eq_ignore_ascii_case("multi") => "multi",
+        _ => "single",
     };
 
     // Best-effort: if the worker fails immediately, surface the error to the UI instead of
@@ -564,36 +657,147 @@ pub fn extract_zip_and_launch_origin(
         })
         .unwrap_or(false);
     let wait_ms = if fast_start { 0 } else { 1200 };
-    if wait_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-    }
-    if let Ok(Some(status)) = child.try_wait() {
-        if !status.success() {
-            let worker_err = fs::read_to_string(&worker_error_path).unwrap_or_default();
-            let detail = if worker_err.trim().is_empty() {
-                format!(
-                    "PowerShell worker exited early ({status}).\nLog: {}\nError: {}",
+
+    loop {
+        let (exe, final_args, worker_name) = match worker_kind {
+            WorkerKind::PowerShell => {
+                let mut args = vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    ps_script_arg.clone(),
+                    "-WorkDir".to_string(),
+                    work_dir_arg.clone(),
+                    "-ExtractDir".to_string(),
+                    extract_dir_arg.clone(),
+                    "-OriginExe".to_string(),
+                    origin_exe_arg.clone(),
+                ];
+                let mut final_args = vec!["-WindowStyle".to_string(), "Hidden".to_string()];
+                final_args.append(&mut args);
+                (powershell_exe_path(), final_args, "PowerShell")
+            }
+            WorkerKind::Python => {
+                let args = vec![
+                    py_script_arg.clone(),
+                    "--work-dir".to_string(),
+                    work_dir_arg.clone(),
+                    "--extract-dir".to_string(),
+                    extract_dir_arg.clone(),
+                    "--origin-exe".to_string(),
+                    origin_exe_arg.clone(),
+                ];
+                (python_exe_path(), args, "Python")
+            }
+        };
+
+        // Clear the error file for this attempt (worker writes details on failure).
+        let _ = fs::write(&worker_error_path, "");
+
+        // Run the worker in background (hidden window).
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new(exe);
+            c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            c
+        };
+
+        // Controlled by UI: reuse a single Origin instance (ApplicationSI) to avoid the expensive
+        // Origin COM shutdown path (EndSession/Exit/Release) on every job.
+        cmd.env(
+            "ORIGINBRIDGE_UI_AUTOMATION",
+            if reuse_origin_ui { "1" } else { "0" },
+        );
+        cmd.env(
+            "ORIGINBRIDGE_MULTI_INSTANCE_UI",
+            if reuse_origin_ui { "0" } else { "1" },
+        );
+        cmd.env("ORIGINBRIDGE_PLOT_MODE", plot_mode_norm);
+        // UI prelaunch is disabled (we prelaunch headless); do not apply "startup Book1" heuristics.
+        cmd.env("ORIGINBRIDGE_UI_PRELAUNCHED", "0");
+        cmd.env("ORIGINBRIDGE_CLOSE_BLANK_BOOK1", "0");
+
+        cmd.args(final_args);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if worker_kind == WorkerKind::Python && !worker_kind_forced {
+                    // Auto-selected Python worker can fall back to legacy PowerShell when Python
+                    // isn't available on the user's machine.
+                    worker_kind = WorkerKind::PowerShell;
+                    continue;
+                }
+                let msg = format!(
+                    "Failed to spawn {worker_name} worker: {e}\nError file: {}",
+                    display_path_for_user(&worker_error_path)
+                );
+                write_worker_error(&msg);
+                return Err(msg);
+            }
+        };
+
+        if wait_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                let worker_err = fs::read_to_string(&worker_error_path).unwrap_or_default();
+                let detail = if worker_err.trim().is_empty() {
+                    format!(
+                        "{worker_name} worker exited early ({status}).\nLog: {}\nError: {}",
+                        display_path_for_user(&worker_log_path),
+                        display_path_for_user(&worker_error_path)
+                    )
+                } else {
+                    worker_err.clone()
+                };
+
+                let should_fallback = if worker_kind == WorkerKind::Python && !worker_kind_forced {
+                    let needle = worker_err.to_ascii_lowercase();
+                    (needle.contains("modulenotfounderror") && needle.contains("originpro"))
+                        || needle.contains("no module named 'originpro'")
+                } else {
+                    false
+                };
+
+                if should_fallback {
+                    worker_kind = WorkerKind::PowerShell;
+                    continue;
+                }
+
+                let msg = format!(
+                    "{worker_name} worker failed.\n\n{detail}\n\nLog: {}\nError file: {}",
                     display_path_for_user(&worker_log_path),
                     display_path_for_user(&worker_error_path)
-                )
-            } else {
-                worker_err
-            };
-            let msg = format!(
-                "PowerShell worker failed.\n\n{detail}\n\nLog: {}\nError file: {}",
-                display_path_for_user(&worker_log_path),
-                display_path_for_user(&worker_error_path)
-            );
-            write_worker_error(&msg);
-            return Err(msg);
+                );
+                write_worker_error(&msg);
+                return Err(msg);
+            }
         }
+
+        break;
     }
+
+    // Refresh the pointer file with the final worker kind (in case we auto-fell back).
+    let trace_hint = format!(
+        "ExtractDir: {}\nWorkDir: {}\nLog: {}\nError: {}\nWorkerKind: {:?}\nWorkerScriptPowerShell: {}\nWorkerScriptPython: {}\n",
+        display_path_for_user(&extract_dir),
+        display_path_for_user(&worker_root),
+        display_path_for_user(&worker_log_path),
+        display_path_for_user(&worker_error_path),
+        worker_kind,
+        display_path_for_user(&worker_ps_script_path),
+        display_path_for_user(&worker_py_script_path),
+    );
+    let _ = fs::write(&trace_hint_path, trace_hint);
 
     Ok(serde_json::json!({
         "extractDir": display_path_for_user(&extract_dir),
         "workDir": display_path_for_user(&worker_root),
         "logPath": display_path_for_user(&worker_log_path),
         "errorPath": display_path_for_user(&worker_error_path),
+        "workerKind": format!("{:?}", worker_kind),
         "ogsPaths": ogs_paths
             .iter()
             .map(|p| display_path_for_user(p))
@@ -633,6 +837,10 @@ fn find_ogs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     walk(dir, &mut ogs_files);
 
     ogs_files
+}
+
+fn build_run_python_script() -> &'static str {
+    include_str!("run_origin_job.py")
 }
 
 fn build_run_script() -> &'static str {
@@ -722,6 +930,40 @@ function Acquire-OriginAutomationLock([int]$timeoutMs = 600000) {
     }
   }
   throw "Timeout waiting for Origin automation lock (${timeoutMs} ms). Another OriginBridge job may still be running."
+}
+
+function Acquire-OriginAutomationSlotLock([int]$maxParallel = 3, [int]$timeoutMs = 600000) {
+  if ($maxParallel -lt 1) { $maxParallel = 1 }
+
+  $tmp = $env:TEMP
+  if (-not $tmp) {
+    try { $tmp = [IO.Path]::GetTempPath() } catch { $tmp = '' }
+  }
+  if (-not $tmp) { $tmp = $WorkDir }
+
+  $lockDir = Join-Path $tmp 'OriginBridge'
+  try {
+    if (-not (Test-Path -LiteralPath $lockDir)) {
+      New-Item -ItemType Directory -Force -Path $lockDir | Out-Null
+    }
+  } catch {
+    # ignore
+  }
+
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+    for ($i = 0; $i -lt $maxParallel; $i++) {
+      $slotPath = Join-Path $lockDir ("origin_multi_instance.slot.{0}.lock" -f $i)
+      try {
+        $fs = [IO.File]::Open($slotPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        return @{ Handle = $fs; Slot = $i; Path = $slotPath }
+      } catch {
+        # occupied
+      }
+    }
+    Start-Sleep -Milliseconds 200
+  }
+  throw "Timeout waiting for multi-instance slot lock (maxParallel=$maxParallel, timeout=${timeoutMs} ms)."
 }
 
 function Release-ComObject($obj) {
@@ -1016,8 +1258,20 @@ function Invoke-FallbackCsvPlot([__ComObject]$origin, [string]$csvPath, [bool]$c
   }
   $pairsExpr = '(' + ($pairs -join ' ') + ')'
 
-  $plotCmd = 'plotxy iy:=' + $pairsExpr + ' plot:=202;'
-  Write-OriginBridgeLog "Plotting (plotxy): $pairsExpr"
+  $plotMode = (($env:ORIGINBRIDGE_PLOT_MODE + '')).Trim().ToLower()
+  $plotCmd = ''
+  if ($plotMode -eq 'multi') {
+    Write-OriginBridgeLog "Plot mode: multi (one graph per XY pair)"
+    $plotCmd = 'string __ob_bk$ = page.name$;'
+    foreach ($p in $pairs) {
+      $one = '(' + $p + ')'
+      $plotCmd += 'win -a $(__ob_bk$); plotxy iy:=' + $one + ' plot:=202;'
+    }
+    Write-OriginBridgeLog "Plotting (plotxy multi): $pairsExpr"
+  } else {
+    $plotCmd = 'plotxy iy:=' + $pairsExpr + ' plot:=202;'
+    Write-OriginBridgeLog "Plotting (plotxy): $pairsExpr"
+  }
   $plotOk = $origin.Execute($plotCmd)
   if ((-not $plotOk) -and (-not $createNewBook)) {
     # When automating an existing Origin UI session, the "current" active window may not be a worksheet.
@@ -1359,7 +1613,7 @@ try {
     }
   }
 
-  if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) {
+  if ((-not (Test-EnvTruthy $env:ORIGINBRIDGE_UI_AUTOMATION)) -and (-not (Test-EnvTruthy $env:ORIGINBRIDGE_MULTI_INSTANCE_UI))) {
     try {
       $originProcName = [IO.Path]::GetFileNameWithoutExtension($originExePath)
       $all = Get-Process -Name $originProcName -ErrorAction SilentlyContinue
@@ -1408,11 +1662,30 @@ try {
   # Without a lock, concurrent COM commands can race and break (e.g. plotxy fails).
   $originLock = $null
   $needLock = ($preferUiAutomation -or $multiInstanceUi)
-  if ($multiInstanceUi -and (Test-EnvTruthy $env:ORIGINBRIDGE_PARALLEL_MULTI_INSTANCE)) {
+  $parallelMulti = ($multiInstanceUi -and (Test-EnvTruthy $env:ORIGINBRIDGE_PARALLEL_MULTI_INSTANCE))
+  if ($parallelMulti) {
     $needLock = $false
-    Write-OriginBridgeLog "Parallel multi-instance enabled; skipping Origin automation lock."
-  }
-  if ($needLock) {
+    $maxParallel = 3
+    try {
+      $raw = [string]$env:ORIGINBRIDGE_PARALLEL_MULTI_INSTANCE_LIMIT
+      if ($raw) {
+        $v = 0
+        if ([int]::TryParse($raw.Trim(), [ref]$v)) {
+          if ($v -lt 1) { $v = 1 }
+          if ($v -gt 10) { $v = 10 }
+          $maxParallel = $v
+        }
+      }
+    } catch {}
+    try {
+      $slot = Acquire-OriginAutomationSlotLock $maxParallel 600000
+      $originLock = $slot.Handle
+      Write-OriginBridgeLog "Multi-instance parallel enabled; acquired slot $($slot.Slot + 1)/$maxParallel ($($slot.Path))"
+    } catch {
+      Write-OriginBridgeLog "Failed to acquire multi-instance slot lock. $($_.Exception.Message)"
+      throw
+    }
+  } elseif ($needLock) {
     try {
       $originLock = Acquire-OriginAutomationLock 600000
       Write-OriginBridgeLog "Origin automation lock acquired."
@@ -1485,7 +1758,8 @@ try {
       try { $origin.Visible = $MAINWND_HIDE } catch {}
     }
   } elseif ($multiInstanceUi) {
-    try { $origin.Visible = $MAINWND_SHOW } catch {}
+    # Multi-instance mode still benefits from headless startup; show UI only after the job.
+    try { $origin.Visible = $MAINWND_HIDE } catch {}
   } elseif (-not $attachedToUiInstance) {
     try { $origin.Visible = $MAINWND_HIDE } catch {}
   }

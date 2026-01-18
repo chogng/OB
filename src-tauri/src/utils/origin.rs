@@ -133,6 +133,34 @@ fn is_process_running_for_exe(exe_path: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+pub fn origin_process_count(origin_exe: &Path) -> u32 {
+    let Some(image_name) = origin_exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return 0;
+    };
+
+    let needle = image_name.to_ascii_lowercase();
+    let Ok(out) = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image_name}"), "/NH"])
+        .output()
+    else {
+        return 0;
+    };
+    if !out.status.success() {
+        return 0;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter(|line| line.trim_start().to_ascii_lowercase().starts_with(&needle))
+        .count() as u32
+}
+
+#[cfg(target_os = "windows")]
 fn maybe_prelaunch_origin_ui(origin_exe: &Path, reuse_origin_ui: bool) -> bool {
     if !reuse_origin_ui {
         return false;
@@ -580,7 +608,9 @@ function Write-OriginBridgeError([string]$message) {
     if ($script:LogPath) { $logInfo = "Log: $script:LogPath`r`n" }
     $body = "OriginBridge failed.`r`n`r`n$message`r`n`r`nWorkDir: $WorkDir`r`n$logInfo"
     Set-Content -Path $path -Value $body -Encoding UTF8
-    Start-Process -FilePath 'notepad.exe' -ArgumentList @($path) | Out-Null
+    if (-not (Test-EnvTruthy $env:ORIGINBRIDGE_NO_ERROR_NOTEPAD)) {
+      Start-Process -FilePath 'notepad.exe' -ArgumentList @($path) | Out-Null
+    }
   } catch {
     # ignore
   }
@@ -1369,7 +1399,12 @@ try {
   # Serialize Origin automation across jobs: selecting multiple ZIPs starts multiple workers.
   # Without a lock, concurrent COM commands can race and break (e.g. plotxy fails).
   $originLock = $null
-  if ($preferUiAutomation -or $multiInstanceUi) {
+  $needLock = ($preferUiAutomation -or $multiInstanceUi)
+  if ($multiInstanceUi -and (Test-EnvTruthy $env:ORIGINBRIDGE_PARALLEL_MULTI_INSTANCE)) {
+    $needLock = $false
+    Write-OriginBridgeLog "Parallel multi-instance enabled; skipping Origin automation lock."
+  }
+  if ($needLock) {
     try {
       $originLock = Acquire-OriginAutomationLock 600000
       Write-OriginBridgeLog "Origin automation lock acquired."

@@ -162,7 +162,7 @@
 
   <script type="module">
     import { invoke } from '@tauri-apps/api/core'
-    import { open } from '@tauri-apps/plugin-dialog'
+    import { open, confirm } from '@tauri-apps/plugin-dialog'
 
 
 
@@ -448,6 +448,28 @@
       }
 
       const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
+
+      if (!reuseOriginUi && pickedZipPaths.length) {
+        let running = 0
+        try {
+          running = Number(await invoke('get_origin_running_process_count')) || 0
+        } catch {
+          running = 0
+        }
+
+        const limit = 10
+        const total = running + pickedZipPaths.length
+        if (total > limit) {
+          const ok = await confirm(
+            `你选择了 ${pickedZipPaths.length} 个 ZIP（多窗口模式）。\n当前正在运行的 Origin 实例数：${running}。\n\nOrigin 可能最多只能同时打开约 ${limit} 个实例，超过后可能启动失败。\n\n建议：勾选「多 ZIP 复用 Origin」或减少 ZIP 数量。\n\n仍然继续吗？`,
+            { title: 'Origin 实例数上限提示', kind: 'warning' }
+          )
+          if (!ok) {
+            setStatus('已取消。请减少 ZIP 数量或使用「多 ZIP 复用 Origin」。')
+            return
+          }
+        }
+      }
 
       setBusy(true)
       try {

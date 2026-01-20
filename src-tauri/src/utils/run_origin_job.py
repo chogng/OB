@@ -370,6 +370,11 @@ def _dry_run_validate(
 
     graphs, template_top, _, default_type = _build_graph_plan(header=header, spec=spec, plot_mode=plot_mode)
 
+    tpl_override = (os.environ.get("ORIGINBRIDGE_TEMPLATE_PATH") or "").strip()
+    if tpl_override:
+        template_top = tpl_override
+        logger.log(f"DRY RUN: template override via ORIGINBRIDGE_TEMPLATE_PATH: {tpl_override}")
+
     logger.log(f"DRY RUN: selected CSV: {csv_path}")
     logger.log(f"DRY RUN: graphs={len(graphs)}")
 
@@ -470,7 +475,49 @@ def _plot_with_originpro(
             raise RuntimeError(f"CSV header is empty: {csv_path}")
 
         logger.log(f"Importing CSV via originpro: {csv_path}")
-        wks = op.new_sheet("w")
+        existing_wb_names: List[str] = []
+        if multi_instance_ui:
+            # In multi-instance UI mode, each new Origin instance typically starts with a default
+            # blank Book1. Reuse it to avoid ending up with Book1 + Book2 for every job.
+            try:
+                existing_wb_names = [wb.name for wb in op.pages("w")]
+            except Exception:
+                existing_wb_names = []
+
+            wks = None
+            # Prefer grabbing the first existing workbook's first sheet (more reliable than
+            # relying on "active" page selection which may not be a workbook).
+            try:
+                wbooks = op.pages("w")
+                if wbooks:
+                    try:
+                        wks = wbooks[0][0]
+                    except Exception:
+                        wks = None
+            except Exception:
+                wks = None
+
+            if wks is None:
+                try:
+                    wks = op.find_sheet("w")
+                except Exception as e:
+                    logger.log(f"Warning: failed to find active worksheet; will create a new workbook: {e}")
+
+            if wks is None:
+                logger.log("No active worksheet found; creating a new workbook for import.")
+                wks = op.new_sheet("w")
+            else:
+                try:
+                    wks.activate()
+                except Exception:
+                    pass
+                try:
+                    wks.clear()
+                except Exception:
+                    pass
+        else:
+            wks = op.new_sheet("w")
+
         # Remove Data Connector after import (matches docs pattern for batch processing).
         wks.from_file(str(csv_path), False)
         try:
@@ -478,9 +525,44 @@ def _plot_with_originpro(
         except Exception as e:
             logger.log(f"Warning: failed to activate worksheet: {e}")
 
+        # Best-effort cleanup: close startup workbooks so each Origin window contains only
+        # the imported data book (instead of e.g. Book1 + Book2).
+        if multi_instance_ui:
+            try:
+                data_book = wks.get_book()
+                keep_name = getattr(data_book, "name", "")
+            except Exception:
+                keep_name = ""
+
+            # If we can't reliably identify the data workbook, don't risk closing anything.
+            if keep_name and existing_wb_names:
+                try:
+                    for wb in op.pages("w"):
+                        try:
+                            name = getattr(wb, "name", "")
+                        except Exception:
+                            name = ""
+                        if not name or name == keep_name:
+                            continue
+                        if name in existing_wb_names:
+                            # In multi-instance UI mode we expect a fresh Origin instance. Remove
+                            # any startup workbooks so each window shows only the imported data.
+                            logger.log(f"Closing startup workbook: {name}")
+                            try:
+                                wb.destroy()
+                            except Exception as e:
+                                logger.log(f"Warning: failed to close workbook {name}: {e}")
+                except Exception as e:
+                    logger.log(f"Warning: failed to cleanup startup workbooks: {e}")
+
         graphs, template_top, out_project_name, default_type = _build_graph_plan(
             header=header, spec=spec, plot_mode=plot_mode
         )
+
+        tpl_override = (os.environ.get("ORIGINBRIDGE_TEMPLATE_PATH") or "").strip()
+        if tpl_override:
+            template_top = tpl_override
+            logger.log(f"Template override via ORIGINBRIDGE_TEMPLATE_PATH: {tpl_override}")
 
         created_graphs = 0
         last_graph = None

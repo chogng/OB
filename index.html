@@ -66,14 +66,6 @@
       flex: 0 0 auto;
     }
 
-    .checkbox {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      user-select: none;
-    }
-
     input[type='text'] {
       width: min(720px, 100%);
       padding: 10px 12px;
@@ -108,7 +100,37 @@
       cursor: not-allowed;
     }
 
+    label.checkbox {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      user-select: none;
+    }
 
+    select {
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, 0.35);
+      background: transparent;
+      color: inherit;
+      outline: none;
+    }
+
+    .status {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, 0.25);
+      background: rgba(127, 127, 127, 0.08);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    .status.error {
+      border-color: rgba(220, 38, 38, 0.35);
+      background: rgba(220, 38, 38, 0.08);
+    }
 
     details {
       margin-top: 18px;
@@ -140,9 +162,36 @@
       <span>保存路径：</span>
       <input id="savePath" type="text" placeholder="例如：C:\Users\lanxi\Documents\OriginBridge"
         value="C:\Users\lanxi\Documents\OriginBridge" style="flex: 1; max-width: 500px;" />
-      <button id="pickSavePathBtn">选择路径</button>
     </div>
 
+    <h2>绘图设置</h2>
+    <div class="row" style="margin-top: 10px">
+      <label class="checkbox" title="勾选：复用同一个 Origin 窗口（更快；适合连续处理多个 ZIP）。不勾选：每个 ZIP 启动一个新的 Origin 窗口。">
+        <input id="reuseOriginUi" type="checkbox" checked />
+        单窗口模式（复用 Origin）
+      </label>
+
+      <span style="margin-left: 6px">绘图模式：</span>
+      <select id="plotMode" title="多对 XY 时：同一图多曲线 / 每对一图（主要影响无 plot.json 的 CSV fallback）">
+        <option value="single">同一图多曲线</option>
+        <option value="multi">每对一图</option>
+      </select>
+
+      <span style="margin-left: 6px">引擎：</span>
+      <select id="workerKind" title="自动：有 plot.json 优先 Python；否则 PowerShell。Python 需要 originpro 环境。">
+        <option value="auto">自动</option>
+        <option value="powershell">PowerShell（OGS/兼容）</option>
+        <option value="python">Python（originpro）</option>
+      </select>
+    </div>
+
+    <div class="row" style="margin-top: 10px">
+      <span>模板(.otpu)：</span>
+      <input id="templatePath" type="text" placeholder="（可选）选择 .otpu 图模板（仅 Python 引擎生效）"
+        style="flex: 1; max-width: 500px;" />
+      <button id="pickTemplateBtn">选择模板</button>
+      <button id="clearTemplateBtn" title="恢复为不使用模板">清除</button>
+    </div>
 
 
     <h2>ZIP 处理</h2>
@@ -150,21 +199,17 @@
     <div class="row" style="margin-top: 10px">
       <button id="pickZipBtn">选择 ZIP</button>
       <button id="extractZipBtn">打开origin</button>
-      <label class="checkbox" title="勾选：所有文件在同一个 Origin 窗口中处理。不勾选：每个文件启动一个新的 Origin 窗口。">
-        <input id="multiZipReuseUi" type="checkbox" checked />
-        单窗口模式
-      </label>
-
+      <span class="muted" style="font-size: 12px">已选：<code id="pickedZipPath">(未选择)</code></span>
     </div>
 
-
+    <div id="status" class="status">Loading...</div>
   </div>
 
   <script type="module">
     import { invoke } from '@tauri-apps/api/core'
-    import { open, confirm } from '@tauri-apps/plugin-dialog'
+    import { open } from '@tauri-apps/plugin-dialog'
 
-
+    const statusEl = document.getElementById('status')
 
     const originExeEl = document.getElementById('originExe')
     const pickOriginExeBtn = document.getElementById('pickOriginExeBtn')
@@ -175,141 +220,84 @@
 
     const pickZipBtn = document.getElementById('pickZipBtn')
     const extractZipBtn = document.getElementById('extractZipBtn')
-    const multiZipReuseUiEl = document.getElementById('multiZipReuseUi')
-    let plotModeEl = document.getElementById('plotMode')
-    let workerKindEl = document.getElementById('workerKind')
 
+    const reuseOriginUiEl = document.getElementById('reuseOriginUi')
+    const plotModeEl = document.getElementById('plotMode')
+    const workerKindEl = document.getElementById('workerKind')
+    const templatePathEl = document.getElementById('templatePath')
+    const pickTemplateBtn = document.getElementById('pickTemplateBtn')
+    const clearTemplateBtn = document.getElementById('clearTemplateBtn')
 
+    const pickedZipPathEl = document.getElementById('pickedZipPath')
     const savePathEl = document.getElementById('savePath')
-    const pickSavePathBtn = document.getElementById('pickSavePathBtn')
 
     let pickedZipPaths = []
     let isBusy = false
 
-    const STORAGE_KEY_MULTI_ZIP_REUSE_UI = 'originbridge.multiZipReuseUi'
+    const STORAGE_KEY_REUSE_ORIGIN_UI = 'originbridge.reuseOriginUi'
     const STORAGE_KEY_PLOT_MODE = 'originbridge.plotMode'
     const STORAGE_KEY_WORKER_KIND = 'originbridge.workerKind'
+    const STORAGE_KEY_TEMPLATE_PATH = 'originbridge.templatePath'
 
-    function loadMultiZipReuseUiSetting() {
+    function loadBoolSetting(key, defaultValue) {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY_MULTI_ZIP_REUSE_UI)
-        if (raw === null || raw === undefined || raw === '') return true
-        return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).trim().toLowerCase())
+        const raw = localStorage.getItem(key)
+        if (raw === null || raw === undefined || raw === '') return Boolean(defaultValue)
+        const v = String(raw).trim().toLowerCase()
+        return ['1', 'true', 'yes', 'y', 'on'].includes(v)
       } catch {
-        return true
+        return Boolean(defaultValue)
       }
     }
 
-    function saveMultiZipReuseUiSetting(v) {
+    function saveBoolSetting(key, v) {
       try {
-        localStorage.setItem(STORAGE_KEY_MULTI_ZIP_REUSE_UI, v ? '1' : '0')
-      } catch {
-        // ignore
-      }
-    }
-
-    if (multiZipReuseUiEl) {
-      multiZipReuseUiEl.checked = loadMultiZipReuseUiSetting()
-      multiZipReuseUiEl.addEventListener('change', () => {
-        saveMultiZipReuseUiSetting(Boolean(multiZipReuseUiEl.checked))
-        if (multiZipReuseUiEl.checked) {
-          // Warm up Origin early so the first plot starts faster in single-window mode.
-          maybePrelaunchOriginUi()
-        }
-      })
-    }
-
-    function ensurePlotModeControl() {
-      if (plotModeEl) return plotModeEl
-      const row = multiZipReuseUiEl?.closest?.('.row')
-      if (!row) return null
-
-      const label = document.createElement('span')
-      label.style.marginLeft = '10px'
-      label.textContent = '绘图模式'
-
-      const select = document.createElement('select')
-      select.id = 'plotMode'
-      select.title = '多对 XY 时：同一图多曲线 或 每对一图'
-      select.innerHTML =
-        '<option value="single">同一图多曲线</option><option value="multi">每对一图</option>'
-
-      row.appendChild(label)
-      row.appendChild(select)
-
-      plotModeEl = select
-      return plotModeEl
-    }
-
-    function ensureWorkerKindControl() {
-      if (workerKindEl) return workerKindEl
-      const row = multiZipReuseUiEl?.closest?.('.row')
-      if (!row) return null
-
-      const label = document.createElement('span')
-      label.style.marginLeft = '10px'
-      label.textContent = '绘图引擎'
-
-      const select = document.createElement('select')
-      select.id = 'workerKind'
-      select.title = '自动：有 plot.json 优先 Python；否则 PowerShell。Python 需要 originpro 环境。'
-      select.innerHTML =
-        '<option value="auto">自动</option><option value="powershell">PowerShell（OGS/兼容）</option><option value="python">Python（originpro）</option>'
-
-      row.appendChild(label)
-      row.appendChild(select)
-
-      workerKindEl = select
-      return workerKindEl
-    }
-
-    function loadPlotModeSetting() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY_PLOT_MODE)
-        const v = String(raw || '').trim().toLowerCase()
-        return v === 'multi' ? 'multi' : 'single'
-      } catch {
-        return 'single'
-      }
-    }
-
-    function savePlotModeSetting(v) {
-      try {
-        const vv = String(v || '').trim().toLowerCase()
-        localStorage.setItem(STORAGE_KEY_PLOT_MODE, vv === 'multi' ? 'multi' : 'single')
+        localStorage.setItem(key, v ? '1' : '0')
       } catch {
         // ignore
       }
     }
 
-    if (ensurePlotModeControl()) {
-      plotModeEl.value = loadPlotModeSetting()
-      plotModeEl.addEventListener('change', () => savePlotModeSetting(plotModeEl.value))
-    }
-
-    function loadWorkerKindSetting() {
+    function loadStrSetting(key, defaultValue) {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY_WORKER_KIND)
-        const v = String(raw || '').trim().toLowerCase()
-        if (v === 'python' || v === 'powershell') return v
-        return 'auto'
+        const raw = localStorage.getItem(key)
+        const s = String(raw || '').trim()
+        return s || String(defaultValue || '')
       } catch {
-        return 'auto'
+        return String(defaultValue || '')
       }
     }
 
-    function saveWorkerKindSetting(v) {
+    function saveStrSetting(key, v) {
       try {
-        const vv = String(v || '').trim().toLowerCase()
-        localStorage.setItem(STORAGE_KEY_WORKER_KIND, vv === 'python' || vv === 'powershell' ? vv : 'auto')
+        localStorage.setItem(key, String(v || ''))
       } catch {
         // ignore
       }
     }
 
-    if (ensureWorkerKindControl()) {
-      workerKindEl.value = loadWorkerKindSetting()
-      workerKindEl.addEventListener('change', () => saveWorkerKindSetting(workerKindEl.value))
+    if (reuseOriginUiEl) {
+      reuseOriginUiEl.checked = loadBoolSetting(STORAGE_KEY_REUSE_ORIGIN_UI, true)
+      reuseOriginUiEl.addEventListener('change', () =>
+        saveBoolSetting(STORAGE_KEY_REUSE_ORIGIN_UI, Boolean(reuseOriginUiEl.checked))
+      )
+    }
+
+    if (plotModeEl) {
+      const v = loadStrSetting(STORAGE_KEY_PLOT_MODE, 'single').toLowerCase()
+      plotModeEl.value = v === 'multi' ? 'multi' : 'single'
+      plotModeEl.addEventListener('change', () => saveStrSetting(STORAGE_KEY_PLOT_MODE, plotModeEl.value))
+    }
+
+    if (workerKindEl) {
+      const v = loadStrSetting(STORAGE_KEY_WORKER_KIND, 'auto').toLowerCase()
+      workerKindEl.value = v === 'python' || v === 'powershell' ? v : 'auto'
+      workerKindEl.addEventListener('change', () => saveStrSetting(STORAGE_KEY_WORKER_KIND, workerKindEl.value))
+    }
+
+    if (templatePathEl) {
+      templatePathEl.value = loadStrSetting(STORAGE_KEY_TEMPLATE_PATH, '')
+      templatePathEl.addEventListener('change', () => saveStrSetting(STORAGE_KEY_TEMPLATE_PATH, templatePathEl.value))
     }
 
     function normalizePickedPaths(selected) {
@@ -335,45 +323,35 @@
         detectOriginExeBtn,
         detectOriginExeDeepBtn,
         saveOriginExeBtn,
-        pickSavePathBtn,
         pickZipBtn,
         extractZipBtn,
-        multiZipReuseUiEl,
+        pickTemplateBtn,
+        clearTemplateBtn,
+        reuseOriginUiEl,
         plotModeEl,
         workerKindEl,
-      ])
+        templatePathEl,
+      ]) {
+        if (!el) continue
         el.disabled = isBusy
+      }
 
       if (!isBusy) extractZipBtn.disabled = !pickedZipPaths.length
     }
 
     function setStatus(msg, isError = false) {
-      if (isError) {
-        console.error(msg)
-      } else {
-        console.log(msg)
-      }
+      statusEl.textContent = msg
+      statusEl.classList.toggle('error', Boolean(isError))
     }
 
     function setPickedZipPaths(paths) {
       pickedZipPaths = normalizePickedPaths(paths)
-      // pickedZipPathEl.textContent = formatPickedPathsForInline(pickedZipPaths)
+      pickedZipPathEl.textContent = formatPickedPathsForInline(pickedZipPaths)
       if (!isBusy) extractZipBtn.disabled = !pickedZipPaths.length
     }
 
     function getOriginExePath() {
       return (originExeEl.value || '').trim()
-    }
-
-    async function maybePrelaunchOriginUi() {
-      if (!invoke) return
-      const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
-      if (!getOriginExePath()) return
-      try {
-        await invoke('prelaunch_origin_ui', { reuseOriginUi })
-      } catch {
-        // ignore
-      }
     }
 
     function setOriginCandidates(candidates) {
@@ -423,7 +401,6 @@
       try {
         const saved = await invoke('set_origin_exe_path', { path: p })
         originExeEl.value = saved || p
-        maybePrelaunchOriginUi()
         setStatus('已保存 Origin 可执行文件：' + (saved || p))
       } catch (e) {
         setStatus(String(e?.message || e), true)
@@ -522,7 +499,7 @@
       }
     }
 
-    async function pickSavePath() {
+    async function pickTemplate() {
       if (!invoke) {
         setStatus('当前页面没有运行在 Tauri 应用内（只能在 OriginBridge 窗口里使用）。', true)
         return
@@ -530,20 +507,29 @@
       setBusy(true)
       try {
         const selected = await open({
-          directory: true,
+          directory: false,
           multiple: false,
-          title: '选择保存路径',
-          defaultPath: savePathEl.value || undefined,
+          title: '选择 Origin 图模板（.otpu/.otp）',
+          filters: [{ name: 'Origin Template', extensions: ['otpu', 'otp'] }],
         })
-
-        if (!selected) return
-
-        savePathEl.value = selected
+        if (!selected) {
+          setStatus('未选择模板。')
+          return
+        }
+        if (templatePathEl) templatePathEl.value = String(selected || '')
+        saveStrSetting(STORAGE_KEY_TEMPLATE_PATH, String(selected || ''))
+        setStatus('已选择模板：' + String(selected || ''))
       } catch (e) {
         setStatus(String(e?.message || e), true)
       } finally {
         setBusy(false)
       }
+    }
+
+    function clearTemplate() {
+      if (templatePathEl) templatePathEl.value = ''
+      saveStrSetting(STORAGE_KEY_TEMPLATE_PATH, '')
+      setStatus('已清除模板。')
     }
 
     async function extractZip() {
@@ -562,37 +548,14 @@
         if (!pickedZipPaths.length) return
       }
 
-      const reuseOriginUi = Boolean(multiZipReuseUiEl?.checked)
-      const plotMode =
-        String(plotModeEl?.value || 'single').trim().toLowerCase() === 'multi' ? 'multi' : 'single'
-      const workerKindRaw = String(workerKindEl?.value || 'auto').trim().toLowerCase()
-      const workerKind =
-        workerKindRaw === 'python' || workerKindRaw === 'powershell' ? workerKindRaw : 'auto'
-
-      if (!reuseOriginUi && pickedZipPaths.length) {
-        let running = 0
-        try {
-          running = Number(await invoke('get_origin_running_process_count')) || 0
-        } catch {
-          running = 0
-        }
-
-        const limit = 10
-        const total = running + pickedZipPaths.length
-        if (total > limit) {
-          const ok = await confirm(
-            `你选择了 ${pickedZipPaths.length} 个 ZIP（多窗口模式）。\n当前正在运行的 Origin 实例数：${running}。\n\nOrigin 可能最多只能同时打开约 ${limit} 个实例，超过后可能启动失败。\n\n建议：勾选「多 ZIP 复用 Origin」或减少 ZIP 数量。\n\n仍然继续吗？`,
-            { title: 'Origin 实例数上限提示', kind: 'warning' }
-          )
-          if (!ok) {
-            setStatus('已取消。请减少 ZIP 数量或使用「多 ZIP 复用 Origin」。')
-            return
-          }
-        }
-      }
-
       setBusy(true)
       try {
+        const reuseOriginUi = Boolean(reuseOriginUiEl?.checked)
+        const plotMode = String(plotModeEl?.value || 'single').trim().toLowerCase() === 'multi' ? 'multi' : 'single'
+        const workerKindRaw = String(workerKindEl?.value || 'auto').trim().toLowerCase()
+        const workerKind = workerKindRaw === 'python' || workerKindRaw === 'powershell' ? workerKindRaw : 'auto'
+        const templatePath = String(templatePathEl?.value || '').trim()
+
         const results = []
         const zips = pickedZipPaths.slice()
 
@@ -608,6 +571,7 @@
               reuseOriginUi,
               plotMode,
               workerKind,
+              templatePath: templatePath || null,
             })
             const ogsCount = Array.isArray(result?.ogsPaths) ? result.ogsPaths.length : 0
             const logHint = result?.logPath ? `\n日志: ${result.logPath}` : ''
@@ -622,9 +586,12 @@
 
         setStatus(
           results.join('\n\n') +
-          (reuseOriginUi
-            ? '\n\n后台将自动执行 OGS，并在出图完成后自动打开/置前当前 Origin 窗口（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
-            : '\n\n后台将自动执行 OGS，并在出图完成后为每个 ZIP 自动打开/置前一个新的 Origin 窗口出图（不保存 .opju，保持 Untitled）。\n\n提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。')
+          '\n\n后台将执行出图任务，结果会显示在 Origin 窗口中。\n' +
+          `模式：${reuseOriginUi ? '单窗口（复用 Origin）' : '多窗口（每个 ZIP 一个 Origin）'}\n` +
+          `引擎：${workerKind}\n` +
+          `绘图模式：${plotMode}\n` +
+          `模板：${templatePath ? templatePath : '(无)'}\n\n` +
+          '提示：默认不会自动清理工作/日志文件夹（.ob 会保留）。如需开启自动清理，设置 ORIGINBRIDGE_ENABLE_CLEANUP=1；如需保留用于排查，设置 ORIGINBRIDGE_KEEP_WORK=1（或 ORIGINBRIDGE_KEEP_TEMP=1）。'
         )
       } catch (e) {
         setStatus(String(e?.message || e), true)
@@ -633,13 +600,14 @@
       }
     }
 
-    pickSavePathBtn.addEventListener('click', pickSavePath)
     pickZipBtn.addEventListener('click', pickZipForExtract)
     extractZipBtn.addEventListener('click', extractZip)
     pickOriginExeBtn.addEventListener('click', pickOriginExe)
     detectOriginExeBtn.addEventListener('click', () => detectOriginExe())
     detectOriginExeDeepBtn.addEventListener('click', () => detectOriginExe({ deepScan: true }))
     saveOriginExeBtn.addEventListener('click', saveOriginExePath)
+    pickTemplateBtn?.addEventListener('click', pickTemplate)
+    clearTemplateBtn?.addEventListener('click', clearTemplate)
     originCandidatesEl.addEventListener('change', () => {
       const v = originCandidatesEl.value || ''
       if (v) originExeEl.value = v
@@ -647,8 +615,6 @@
 
     setPickedZipPaths([])
     refreshOriginExePath().finally(() => {
-      // Warm up Origin early so the first plot starts faster in single-window mode.
-      maybePrelaunchOriginUi()
       if (!getOriginExePath()) setStatus('请先配置 Origin 可执行文件路径。', true)
       else setStatus('就绪。')
     })

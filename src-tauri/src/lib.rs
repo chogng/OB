@@ -108,6 +108,7 @@ fn extract_zip_and_open_origin(
     reuse_origin_ui: Option<bool>,
     plot_mode: Option<String>,
     worker_kind: Option<String>,
+    template_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let zip_path = zip_path.trim();
     if zip_path.is_empty() {
@@ -145,6 +146,7 @@ fn extract_zip_and_open_origin(
             reuse_origin_ui,
             plot_mode,
             worker_kind,
+            template_path,
         )
         .map_err(|e| format!("Failed to extract and open: {e}"))?;
         return Ok(result);
@@ -153,6 +155,11 @@ fn extract_zip_and_open_origin(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = zip_path;
+        let _ = save_path;
+        let _ = reuse_origin_ui;
+        let _ = plot_mode;
+        let _ = worker_kind;
+        let _ = template_path;
         Err("This feature is only supported on Windows".to_string())
     }
 }

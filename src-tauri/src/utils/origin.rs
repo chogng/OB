@@ -412,6 +412,7 @@ pub fn extract_zip_and_launch_origin(
     reuse_origin_ui: bool,
     plot_mode: Option<String>,
     worker_kind_override: Option<String>,
+    template_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use std::fs;
 
@@ -606,6 +607,40 @@ pub fn extract_zip_and_launch_origin(
         let _ = fs::write(&worker_error_path, body);
     };
 
+    // Optional: copy a user-selected template into the work dir so the worker can always
+    // access it even if the original file moves.
+    let mut template_path_for_worker: Option<std::path::PathBuf> = None;
+    if let Some(tp_raw) = template_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let src = std::path::PathBuf::from(tp_raw);
+        if !src.exists() {
+            let msg = format!("Template not found: {}", src.display());
+            write_worker_error(&msg);
+            return Err(msg);
+        }
+        if !src.is_file() {
+            let msg = format!("Template path is not a file: {}", src.display());
+            write_worker_error(&msg);
+            return Err(msg);
+        }
+
+        let file_name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("template.otpu");
+        let file_name = sanitize_path_component(file_name);
+        let dest = worker_root.join(file_name);
+
+        match fs::copy(&src, &dest) {
+            Ok(_) => template_path_for_worker = Some(dest),
+            Err(e) => {
+                // Fall back to using the original absolute path.
+                let _ = e;
+                template_path_for_worker = Some(src);
+            }
+        }
+    }
+
     if origin_exe.as_os_str().is_empty() {
         let msg = "Origin executable path is empty.".to_string();
         write_worker_error(&msg);
@@ -714,6 +749,9 @@ pub fn extract_zip_and_launch_origin(
             if reuse_origin_ui { "0" } else { "1" },
         );
         cmd.env("ORIGINBRIDGE_PLOT_MODE", plot_mode_norm);
+        if let Some(tp) = template_path_for_worker.as_ref() {
+            cmd.env("ORIGINBRIDGE_TEMPLATE_PATH", display_path_for_user(tp));
+        }
         // UI prelaunch is disabled (we prelaunch headless); do not apply "startup Book1" heuristics.
         cmd.env("ORIGINBRIDGE_UI_PRELAUNCHED", "0");
         cmd.env("ORIGINBRIDGE_CLOSE_BLANK_BOOK1", "0");
@@ -780,13 +818,18 @@ pub fn extract_zip_and_launch_origin(
     }
 
     // Refresh the pointer file with the final worker kind (in case we auto-fell back).
+    let template_hint = template_path_for_worker
+        .as_ref()
+        .map(|p| display_path_for_user(p))
+        .unwrap_or_else(|| "<none>".to_string());
     let trace_hint = format!(
-        "ExtractDir: {}\nWorkDir: {}\nLog: {}\nError: {}\nWorkerKind: {:?}\nWorkerScriptPowerShell: {}\nWorkerScriptPython: {}\n",
+        "ExtractDir: {}\nWorkDir: {}\nLog: {}\nError: {}\nWorkerKind: {:?}\nTemplate: {}\nWorkerScriptPowerShell: {}\nWorkerScriptPython: {}\n",
         display_path_for_user(&extract_dir),
         display_path_for_user(&worker_root),
         display_path_for_user(&worker_log_path),
         display_path_for_user(&worker_error_path),
         worker_kind,
+        template_hint,
         display_path_for_user(&worker_ps_script_path),
         display_path_for_user(&worker_py_script_path),
     );
